@@ -19,7 +19,10 @@ build toolchain and image instructions. Its base commit is recorded in
 libraries. Cross-target test execution must explicitly supply `GO_TEST_EXEC`.
 The cloud Python worker itself requires no native inference libraries.
 
-`release.yaml` describes the composed artifact. Historical local OCI references
+`release.yaml` retains the historical preview artifact and its original source
+composition; it does not identify a rebuilt image for the current source tree.
+Build current sources from `dependencies.lock.json` and `patches/series`, and
+record a new operator-owned release contract before deployment. Historical local OCI references
 are provenance identifiers, not publicly available registry downloads. When the
 composed Go source is identical, an existing verified router binary can be reused;
 the separately mounted Python worker still needs the new package and contract

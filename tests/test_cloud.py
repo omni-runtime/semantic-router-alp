@@ -4,9 +4,7 @@ import subprocess
 import sys
 
 import pytest
-from conftest import PAYLOADS, canonical
-from conftest import body
-
+from conftest import PAYLOADS, body, canonical
 from semantic_router_alp.cloud import CloudAdapter
 from semantic_router_alp.errors import ALPError
 from semantic_router_alp.host_tasks import AgentCallTask, host_task_headers
@@ -93,12 +91,12 @@ def test_stop_compatibility_is_explicit_and_still_validates(config):
         adapter.complete(state, json.dumps(output), allow_stop_tool_call=True)
 
 
-def test_cloud_context_uses_shared_definition_generation_contract(config):
+def test_cloud_context_preserves_protocol_optional_dependencies(config):
     adapter = CloudAdapter(config)
     prepared = adapter.prepare(json.dumps(body("agent_definition_generate")))
     context = json.loads(prepared["body"]["messages"][0]["content"])
     schema = context["allowed_action_contracts"][0]["body_schema"]["properties"]["payload"]
-    assert {"resource_requirements", "requested_tools"}.issubset(schema["required"])
+    assert not {"resource_requirements", "requested_tools"} & set(schema["required"])
     assert not {"protocol_version", "request_id", "payload"} & schema["properties"].keys()
     for name, tool in config.catalogs["product-assistant"].tools.items():
         assert context["visible_catalog"]["tool_contracts"][name] == tool.model_dump(exclude_none=True)
@@ -132,9 +130,10 @@ def test_private_history_retains_provider_items_and_pairs_final(config):
     output["choices"][0]["message"]["reasoning_content"] = "private provider history"
     result = adapter.complete(state, json.dumps(output))
     assert "private provider history" not in json.dumps(result["response"])
-    next_turn = adapter.prepare(json.dumps(body("agent_call")), history=result["history"])
-    assert next_turn["body"]["messages"][-3]["reasoning_content"] == "private provider history"
-    assert next_turn["body"]["messages"][-2]["role"] == "tool"
+    assert result["history"]["messages"][-2]["reasoning_content"] == "private provider history"
+    assert result["history"]["messages"][-1]["content"] == '{"alp_terminal_ack":true}'
+    with pytest.raises(ALPError, match="finalized"):
+        adapter.prepare(json.dumps(body("agent_call")), history=result["history"])
 
 
 def test_pending_history_requires_exact_result_pair(config):
@@ -288,7 +287,6 @@ def test_provider_strict_opt_in_does_not_claim_enforcement(config):
 
 def test_native_schema_visibility_preserves_union_validation():
     from jsonschema import Draft202012Validator
-
     from semantic_router_alp.cloud_projection import expose_native_schema
 
     schema = {"$defs": {"Word": {"type": "string"}}, "anyOf": [
@@ -313,8 +311,10 @@ def test_native_schema_visibility_preserves_union_validation():
 
 def test_bound_native_schema_keeps_host_values_and_union_domain():
     from jsonschema import Draft202012Validator
-
-    from semantic_router_alp.cloud_projection import _expose_bound_types, expose_native_schema
+    from semantic_router_alp.cloud_projection import (
+        _expose_bound_types,
+        expose_native_schema,
+    )
 
     literal = {"anyOf": [{"type": "object"}, {"type": "object"}]}
     schema = {"anyOf": [
@@ -336,7 +336,6 @@ def test_bound_native_schema_keeps_host_values_and_union_domain():
 
 def test_native_schema_visibility_keeps_literals_and_unsafe_unions_intact():
     from jsonschema import Draft202012Validator
-
     from semantic_router_alp.cloud_projection import expose_native_schema
 
     literal = {"anyOf": [{"type": "object"}, {"type": "object"}], "$ref": "#/$defs/Foo"}
@@ -361,7 +360,6 @@ def test_native_schema_visibility_keeps_literals_and_unsafe_unions_intact():
 @pytest.mark.parametrize("operation", list(PAYLOADS))
 def test_native_projection_keeps_canonical_rejections(config, operation):
     from jsonschema import Draft202012Validator
-
     from semantic_router_alp.cloud_projection import expose_native_schema
 
     adapter = CloudAdapter(config, projection="typed")

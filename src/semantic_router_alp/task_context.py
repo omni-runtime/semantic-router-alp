@@ -8,9 +8,15 @@ import hmac
 import os
 import time
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
-from .catalog import Catalog, PayloadConstraints, ServerConfig, stable_json
+from .catalog import (
+    Catalog,
+    PayloadConstraints,
+    ResponseConstraints,
+    ServerConfig,
+    stable_json,
+)
 from .errors import ALPError
 from .protocol import ALPChatRequest, Operation, StrictModel
 
@@ -21,11 +27,20 @@ DOMAIN = b"alp-host-task-v1:"
 
 
 class TaskContext(StrictModel):
-    version: int = Field(default=1, ge=1, le=1)
+    version: int = Field(default=1, ge=1, le=2)
     issued_at: int
     expires_at: int
     request_digest: str
-    constraints: dict[Operation, PayloadConstraints] = Field(min_length=1, max_length=6)
+    constraints: dict[Operation, PayloadConstraints] = Field(default_factory=dict, max_length=6)
+    response: ResponseConstraints | None = None
+
+    @model_validator(mode="after")
+    def check_version(self):
+        if not self.constraints and self.response is None:
+            raise ValueError("Empty host constraints")
+        if self.response is not None and self.version != 2:
+            raise ValueError("Response constraints require host context v2")
+        return self
 
 
 def request_digest(request: ALPChatRequest) -> str:
@@ -37,6 +52,7 @@ def task_headers(
     constraints: dict[Operation, PayloadConstraints],
     *,
     key: bytes,
+    response: ResponseConstraints | None = None,
     ttl_seconds: int = 60,
     now: int | None = None,
 ) -> dict[str, str]:
@@ -45,6 +61,7 @@ def task_headers(
         raise ValueError("Use a key of at least 32 bytes and a TTL between 1 and 300 seconds")
     issued = int(time.time()) if now is None else now
     context = TaskContext(
+        version=2 if response is not None else 1, response=response,
         issued_at=issued, expires_at=issued + ttl_seconds,
         request_digest=request_digest(request), constraints=constraints,
     )
@@ -93,30 +110,32 @@ def bind_task_constraints(
         raise reject() from None
 
     bound = catalog.model_copy(deep=True)
-    for operation, extra in context.constraints.items():
-        if operation not in catalog.allowed_operations:
-            raise reject()
-        if extra.capabilities and operation != "agent_definition_generate":
-            raise reject()
-        base = bound.payload_constraints.get(operation, PayloadConstraints())
-        for path in base.fixed_values.keys() & extra.fixed_values.keys():
-            if stable_json(base.fixed_values[path]) != stable_json(extra.fixed_values[path]):
-                raise reject()
-        try:
-            capabilities = {**base.capabilities}
-            if capabilities and not set(extra.capabilities).issubset(capabilities):
-                raise reject()
-            for name, contract in extra.capabilities.items():
-                before = capabilities[name].model_dump(exclude_none=True) if name in capabilities else {}
-                after = contract.model_dump(exclude_none=True)
-                if any(stable_json(before[k]) != stable_json(after[k]) for k in before.keys() & after.keys()):
-                    raise reject()
-                capabilities[name] = {**before, **after}
-            bound.payload_constraints[operation] = PayloadConstraints(
-                required_fields=list(dict.fromkeys([*base.required_fields, *extra.required_fields])),
-                fixed_values={**base.fixed_values, **extra.fixed_values},
-                capabilities=capabilities,
-            )
-        except ValueError:
-            raise reject() from None
+    from .response_constraints import merge_payload, validate_plan
+    try:
+        for operation, extra in context.constraints.items():
+            if operation not in catalog.allowed_operations:
+                raise ValueError("Unavailable operation")
+            bound.payload_constraints[operation] = merge_payload(
+                bound.payload_constraints.get(operation, PayloadConstraints()), extra)
+        if context.response is not None:
+            base = bound.response_constraints
+            extra = context.response
+            if base is not None:
+                if extra.min_calls < base.min_calls or extra.max_calls > base.max_calls:
+                    raise ValueError("Host response bounds cannot be widened")
+                if base.members:
+                    if not extra.members or len(base.members) != len(extra.members):
+                        raise ValueError("Host response members cannot be removed")
+                    extra = extra.model_copy(deep=True)
+                    for before, after in zip(base.members, extra.members, strict=True):
+                        if before.operation != after.operation:
+                            raise ValueError("Host response operation cannot change")
+                        after.payload = merge_payload(before.payload, after.payload)
+            bound.response_constraints = extra
+        operations = request.alp.allowed_operations
+        if request.alp.choice != "required":
+            operations = [request.alp.choice.operation]
+        validate_plan(request.alp.protocol_version, operations, bound)
+    except (ValueError, ALPError):
+        raise reject() from None
     return bound

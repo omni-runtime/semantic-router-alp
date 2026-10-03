@@ -1,5 +1,7 @@
 # semantic-router-alp
 
+Supports ALP 0.3 (default) and opt-in 0.4 response collections. See [protocol versions and result pairing](docs/protocol-04.md).
+
 Provider-native Agent Lifecycle Protocol (ALP) integration for Semantic Router.
 
 [简体中文](README.zh-CN.md) · [Protocol behavior](docs/protocol.md) · [Configuration](docs/configuration.md)
@@ -14,7 +16,7 @@ It is an independent integration project, not an official vLLM distribution.
 `omni-runtime/alp_schema_mcp` is a **private dependency**. Obtain access from its
 maintainers before installing. Its source and contract bundle are not distributed
 in this repository or public images. This project requires package version 0.3.0
-and ALP protocol 0.3.0 draft 1. It does not depend on `vllm-alp`, vLLM, MLX,
+at the pinned revision, supporting ALP 0.3 and opt-in 0.4 draft 1. It does not depend on `vllm-alp`, vLLM, MLX,
 XGrammar, PyTorch, a tokenizer or a GPU.
 
 ```bash
@@ -36,7 +38,8 @@ belong in `inference-stack`'s private instance configuration.
 The authoritative schema, operation map and native API envelope come from
 `alp_schema_mcp`; there is no vendored protocol copy. Plugin-local helpers specialize catalogs and trusted host requirements.
 There is no separate alp-core package or service. This adapter projects
-those contracts into native cloud tools and validates exactly one completed call.
+those contracts into native cloud tools and validates the complete response:
+one call in 0.3, or 1–16 ordinary calls in 0.4.
 The `api_json` projection decodes `payload_json` exactly once. The optional `typed`
 projection restores the same canonical ALP object without repairing model output.
 Provider strict mode is not treated as proof of complete protocol enforcement.
@@ -44,7 +47,8 @@ Provider strict mode is not treated as proof of complete protocol enforcement.
 SR retains routing, provider credentials, dispatch and caller-bound private replay.
 The worker uses bounded local stdio; it neither sends cloud requests nor executes
 an agent or tool. Authorization and execution remain the host's responsibility.
-Invalid, refused, truncated, mixed or parallel calls fail closed. Terminal calls
+Invalid, refused, truncated or mixed-content responses fail closed. ALP 0.4
+collections are admitted atomically; 0.3 still rejects parallel calls. Terminal calls
 receive a paired local acknowledgement without another generation.
 
 ## Build and test

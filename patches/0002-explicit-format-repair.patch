@@ -1,0 +1,100 @@
+diff --git a/src/semantic-router/pkg/alptransport/history.go b/src/semantic-router/pkg/alptransport/history.go
+--- a/src/semantic-router/pkg/alptransport/history.go
++++ b/src/semantic-router/pkg/alptransport/history.go
+@@ -33,6 +33,16 @@
+ 	if !ok || e.scope != scope || !time.Now().Before(e.expires) {
+ 		return nil, false
+ 	}
++	// A repair token is a single-use capability, including concurrent retries.
++	var saved struct {
++		History struct {
++			Repair json.RawMessage `json:"repair"`
++		} `json:"history"`
++	}
++	if json.Unmarshal(e.history, &saved) == nil && len(saved.History.Repair) > 0 && string(saved.History.Repair) != "null" {
++		delete(s.entries, token)
++		s.bytes -= len(e.history)
++	}
+ 	return append(json.RawMessage(nil), e.history...), true
+ }
+ 
+diff --git a/src/semantic-router/pkg/extproc/processor_alp.go b/src/semantic-router/pkg/extproc/processor_alp.go
+--- a/src/semantic-router/pkg/extproc/processor_alp.go
++++ b/src/semantic-router/pkg/extproc/processor_alp.go
+@@ -11,6 +11,7 @@
+ 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+ 	http_ext "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
+ 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
++	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+ 
+ 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/alptransport"
+@@ -175,6 +176,22 @@
+ 		return r.createErrorResponse(503, "ALP contract worker unavailable")
+ 	}
+ 	if !result.OK {
++		// Failed actions are never returned as accepted ALP calls. Only an opaque,
++		// caller-scoped token allows one explicit provider-native format repair.
++		if len(result.History) > 0 && gjson.GetBytes(result.History, "repair.remaining").Int() == 1 {
++			saved, err := json.Marshal(map[string]any{"model": ctx.RequestModel, "history": result.History})
++			if err != nil {
++				return r.createErrorResponse(502, "invalid ALP repair history")
++			}
++			token, err := alpReplay.Put(ctx.alpBinding.scope, saved)
++			if err != nil {
++				return r.createErrorResponse(503, "ALP replay capacity unavailable")
++			}
++			failure, _ := json.Marshal(map[string]any{"error": result.Error, "alp": map[string]any{
++				"provider_state": token, "format_repair_available": true, "validated": false, "executed": false,
++			}})
++			return r.createJSONResponseWithBody(result.Status, failure, headers.ResponsePathError)
++		}
+ 		return r.alpWorkerError(result)
+ 	}
+ 	if len(result.Response) == 0 || len(result.History) == 0 {
+diff --git a/src/semantic-router/pkg/extproc/processor_alp_test.go b/src/semantic-router/pkg/extproc/processor_alp_test.go
+--- a/src/semantic-router/pkg/extproc/processor_alp_test.go
++++ b/src/semantic-router/pkg/extproc/processor_alp_test.go
+@@ -73,6 +73,12 @@
+ 	} else {
+ 		var body string
+ 		_ = json.Unmarshal(input["body"], &body)
++		if body == "recoverable" {
++			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": false, "status": 502,
++				"error":   map[string]any{"type": "alp_error", "code": "INVALID_ALP_OUTPUT"},
++				"history": map[string]any{"messages": []string{"private failed output"}, "repair": map[string]int{"remaining": 1}}})
++			os.Exit(0)
++		}
+ 		if body == "invalid" {
+ 			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": false, "status": 502, "error": map[string]any{"type": "alp_error", "code": "INVALID_ALP_OUTPUT", "message": "Invalid output."}})
+ 			os.Exit(0)
+@@ -193,3 +199,29 @@
+ 		t.Fatal("global entrypoint policy was bypassed")
+ 	}
+ }
++
++func TestNativeALPExplicitRepairToken(t *testing.T) {
++	r := alpTestRouter(t)
++	ctx := &RequestContext{Headers: map[string]string{":path": "/v1/alp/chat/completions", "authorization": "Bearer repair-caller"}}
++	_, early := r.prepareALPRequest([]byte(`{"model":"cloud/chat","alp":{"catalog_ref":"demo"}}`), ctx)
++	if early != nil {
++		t.Fatal("prepare failed")
++	}
++	ctx.UpstreamStatusCode, ctx.RequestModel = 200, "cloud/chat"
++	res := r.handleALPResponseBody([]byte("recoverable"), ctx).GetResponseBody().GetResponse()
++	body := res.GetBodyMutation().GetBody()
++	token := gjson.GetBytes(body, "alp.provider_state").String()
++	if token == "" || !gjson.GetBytes(body, "alp.format_repair_available").Bool() || bytes.Contains(body, []byte("private")) || gjson.GetBytes(body, "alp.validated").Bool() {
++		t.Fatal("repair state leaked or was accepted")
++	}
++	if _, ok := alpReplay.Get(token, "another-caller"); ok {
++		t.Fatal("foreign caller took state")
++	}
++	saved, ok := alpReplay.Get(token, ctx.alpBinding.scope)
++	if !ok || !bytes.Contains(saved, []byte("private failed output")) {
++		t.Fatal("private provider replay lost")
++	}
++	if _, ok := alpReplay.Get(token, ctx.alpBinding.scope); ok {
++		t.Fatal("repair token reused")
++	}
++}

@@ -65,8 +65,13 @@ def check_schema(schema: dict | bool) -> None:
 
 
 @lru_cache(maxsize=1)
+def _catalog_contracts():
+    return ContractCatalog()
+
+
+@lru_cache(maxsize=1)
 def _identifier_validators():
-    contracts = ContractCatalog()
+    contracts = _catalog_contracts()
     return {
         name: Draft202012Validator(contracts.schema("protocol", name))
         for name in ("Id", "Name", "CatalogRef", "ReleaseVersion")
@@ -76,12 +81,15 @@ def _identifier_validators():
 class Capability(StrictModel):
     description: str = ""
     input_schema: dict[str, Any]
+    state_effect: Literal["read", "write"] | None = None
+    external_effect: Literal["none", "read", "write"] | None = None
 
 
 class Agent(StrictModel):
     description: str = ""
     input_schema: dict[str, Any]
     capabilities: dict[str, Capability] = Field(default_factory=dict)
+    state_version: int | None = Field(default=None, ge=1, le=2147483647)
 
 
 class Tool(StrictModel):
@@ -120,6 +128,7 @@ class HandlerContract(StrictModel):
 class PayloadConstraints(StrictModel):
     """Operator-owned constraints, addressed by object pointers under payload."""
 
+    forbidden_fields: list[str] = Field(default_factory=list, max_length=64)
     required_fields: list[str] = Field(default_factory=list, max_length=64)
     fixed_values: dict[str, Any] = Field(default_factory=dict, max_length=64)
     capabilities: dict[str, CapabilityContract] = Field(default_factory=dict, max_length=32)
@@ -128,14 +137,18 @@ class PayloadConstraints(StrictModel):
     def check_paths(self):
         if len(set(self.required_fields)) != len(self.required_fields):
             raise ValueError("Constraint paths must be unique")
-        for path in [*self.required_fields, *self.fixed_values]:
+        for path in [*self.required_fields, *self.fixed_values, *self.forbidden_fields]:
             if not path.startswith("/") or len(path) > 512 or len(path.split("/")) > 9:
                 raise ValueError("Use object JSON Pointers relative to payload, depth at most 8")
             if any(not part or "~" in part.replace("~0", "").replace("~1", "")
                    for part in path[1:].split("/")):
                 raise ValueError("Invalid object JSON Pointer")
+        for forbidden in self.forbidden_fields:
+            if any(path == forbidden or path.startswith(forbidden + "/")
+                   for path in [*self.required_fields, *self.fixed_values]):
+                raise ValueError("A forbidden field cannot also be required or fixed")
         json.dumps(self.fixed_values, allow_nan=False)
-        contracts = ContractCatalog()
+        contracts = _catalog_contracts()
         for name, capability in self.capabilities.items():
             if not _identifier_validators()["Name"].is_valid(name):
                 raise ValueError("Invalid capability name")
@@ -147,6 +160,33 @@ class PayloadConstraints(StrictModel):
         return self
 
 
+class ResponseMember(StrictModel):
+    operation: Operation
+    payload: PayloadConstraints = Field(default_factory=PayloadConstraints)
+
+
+class ResponseConstraints(StrictModel):
+    """Trusted response bounds; never an ALP model-output envelope."""
+    min_calls: int = Field(default=1, ge=1, le=16)
+    max_calls: int = Field(default=16, ge=1, le=16)
+    members: list[ResponseMember] | None = Field(default=None, min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def check_bounds(self):
+        if self.members is not None:
+            for field in ("min_calls", "max_calls"):
+                if field in self.model_fields_set and getattr(self, field) != len(self.members):
+                    raise ValueError("Ordered members require their exact response count")
+                setattr(self, field, len(self.members))
+            if len(self.members) > 1 and any(m.operation == "agent_final" or
+                m.operation == "tool_call" and m.payload.fixed_values.get("/tool") == "resource.bindings.update"
+                for m in self.members):
+                raise ValueError("Exclusive ALP actions require a singleton response")
+        if self.min_calls > self.max_calls:
+            raise ValueError("Empty response count range")
+        return self
+
+
 class Catalog(StrictModel):
     allowed_operations: list[Operation]
     agents: dict[str, Agent] = Field(default_factory=dict)
@@ -154,11 +194,17 @@ class Catalog(StrictModel):
     final_format: Literal["text", "json"] = "text"
     final_schema: dict[str, Any] | None = None
     payload_constraints: dict[Operation, PayloadConstraints] = Field(default_factory=dict)
+    response_constraints: ResponseConstraints | None = None
     definition_field_order: Literal["contract", "flexible"] = "contract"
     explicit_definition_output: bool = False
     explicit_session_mode: bool = False
     compact_prompt: bool = False
     compact_task_context: bool = True
+    semantic_rendering: bool = True
+    # Native 4B engines need separately measured presentation, not cloud defaults.
+    local_render_profile: Literal["stable", "generation"] = "stable"
+    # Observed business-state version supplied by the trusted Runtime, not the model.
+    current_state_version: int | None = Field(default=None, ge=1, le=2147483647)
     generation_text_limit: int = Field(default=0, ge=0, le=16000)
     generation_instruction_limit: int = Field(default=0, ge=0, le=16000)
     # None means the host did not provide this domain; [] means no choices.
@@ -178,7 +224,7 @@ class Catalog(StrictModel):
         if any(c.capabilities and op != "agent_definition_generate" for op, c in self.payload_constraints.items()):
             raise ValueError("Named capability contracts apply only to definition generation")
         identifiers = _identifier_validators()
-        contracts = ContractCatalog()
+        contracts = _catalog_contracts()
         for name, tool in self.tools.items():
             reserved = contracts.resource_tools.get(name)
             if reserved and (tool.external_effect not in (None, reserved["external_effect"]) or tool.state_effect != reserved["state_effect"]):
@@ -247,6 +293,8 @@ class ServerConfig(StrictModel):
     chat_template_kwargs: dict[str, Any] = Field(default_factory=lambda: {"enable_thinking": False})
     allow_reasoning: bool = False
     task_signing_key_env: str | None = None
+    # Provider support must be probed; auto preserves named selection for one function.
+    native_tool_choice_policy: Literal["auto", "required", "named"] = "auto"
 
     @classmethod
     def from_file(cls, path: str | Path) -> ServerConfig:

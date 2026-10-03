@@ -12,7 +12,7 @@ from alp_schema_mcp.catalog import ContractCatalog
 from jsonschema import Draft202012Validator
 from pydantic import Field, TypeAdapter, model_validator
 
-from .catalog import CapabilityContract, PayloadConstraints
+from .catalog import CapabilityContract, PayloadConstraints, ResponseConstraints
 from .protocol import ALPChatRequest, StrictModel
 
 
@@ -48,7 +48,7 @@ class AgentCallTask(StrictModel):
         payload = self.payload()
         fixed = {"/" + k: v for k, v in payload.items() if k != "input"}
         fixed.update({"/input/" + k: v for k, v in payload["input"].items()})
-        return PayloadConstraints(fixed_values=fixed)
+        return PayloadConstraints(fixed_values=fixed, forbidden_fields=[] if self.expected_state_version is not None else ["/expected_state_version"])
 
 
 class DefinitionTask(StrictModel):
@@ -115,5 +115,18 @@ def host_task_headers(request: ALPChatRequest, task: HostTask | dict, *, key: by
     # unconstrained escape route. Callers select the operation in the request.
     if choice == "required" and request.alp.allowed_operations != [task.operation]:
         raise ValueError("Select the host task operation explicitly")
-    return task_headers(request, {task.operation: task.constraints()}, key=key,
-                        ttl_seconds=ttl_seconds, now=now)
+    constraints = task.constraints()
+    response = ResponseConstraints(members=[{"operation": task.operation, "payload": constraints}]) if request.alp.protocol_version == "0.4.0" else None
+    return task_headers(request, {} if response else {task.operation: constraints}, key=key,
+                        response=response, ttl_seconds=ttl_seconds, now=now)
+
+
+def host_response_headers(request, members, *, key, ttl_seconds=60, now=None):
+    """Sign reviewed ordered operation/payload requirements for one 0.4 turn."""
+    from .task_context import task_headers
+    if request.alp.protocol_version != "0.4.0":
+        raise ValueError("An ordered host response requires ALP 0.4")
+    plan = ResponseConstraints(members=members)
+    if any(m.operation not in request.alp.allowed_operations for m in plan.members):
+        raise ValueError("Host response operation is unavailable")
+    return task_headers(request, {}, response=plan, key=key, ttl_seconds=ttl_seconds, now=now)

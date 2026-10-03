@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from alp_schema_mcp.catalog import ContractCatalog
-from alp_schema_mcp.validation import MAX_JSON_DEPTH, MAX_REQUEST_BYTES, validate_document
+from alp_schema_mcp.validation import (
+    MAX_JSON_DEPTH,
+    MAX_REQUEST_BYTES,
+    validate_action_response,
+    validate_document,
+)
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry
 from referencing.exceptions import NoSuchResource
@@ -69,7 +74,7 @@ class ALPParser:
                 self._depth -= 1
         self._parts.append(text)
 
-    def finish(self, reason: str | None) -> dict[str, Any]:
+    def finish(self, reason: str | None) -> dict[str, Any] | list[dict[str, Any]]:
         if self._finished:
             raise ALPError("DUPLICATE_FINISH", "A completion can be accepted only once.", 502)
         self._finished = True
@@ -77,7 +82,9 @@ class ALPParser:
             raise ALPError(
                 "INCOMPLETE_GENERATION", "The model did not complete a normal ALP generation.", 502
             )
-        report = validate_document(self.raw, self.codec, self.contracts)
+        multi = self.contracts.version == "0.4.0"
+        validate = validate_action_response if multi else validate_document
+        report = validate(self.raw, self.codec, self.contracts)
         if not report["valid"]:
             raise ALPError(
                 "INVALID_ALP_OUTPUT",
@@ -85,7 +92,19 @@ class ALPParser:
                 502,
                 report["errors"],
             )
-        canonical = report["canonical"]
+        canonical = report["requests"] if multi else report["canonical"]
+        from .response_constraints import validate_response
+        validate_response(canonical if multi else [canonical], self.profile.catalog)
+        for index, request in enumerate(canonical if multi else [canonical]):
+            try:
+                self.validate_member(request, index)
+            except ALPError as exc:
+                if multi:
+                    exc.details = [{**detail, "action_index": index} for detail in (exc.details or [])]
+                raise
+        return canonical
+
+    def validate_member(self, canonical, index=0):
         operation = canonical["operation"]
         if operation not in self.profile.operations:
             raise ALPError(
@@ -93,7 +112,7 @@ class ALPParser:
             )
         body = {key: canonical[key] for key in ("protocol_version", "request_id", "payload")}
         validator = Draft202012Validator(
-            self.profile.body_schemas[operation],
+            self.profile.member_schemas[index] if self.profile.member_schemas else self.profile.body_schemas[operation],
             format_checker=FormatChecker(),
             registry=Registry(retrieve=_deny_remote),
         )
@@ -114,8 +133,8 @@ class ALPParser:
                 "INVALID_CALL_ARGUMENTS", "The call does not satisfy this catalog.", 502, errors
             )
         from .host_contracts import validate_host_contracts
-
-        errors = validate_host_contracts(canonical, self.profile.catalog, self.contracts)
+        from .response_constraints import member_catalog
+        errors = validate_host_contracts(canonical, member_catalog(self.profile.catalog, index), self.contracts)
         if errors:
             raise ALPError("INVALID_HOST_CONTRACT", "The output violates a trusted host contract.", 502, errors[:32])
         return canonical

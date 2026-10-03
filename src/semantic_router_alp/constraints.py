@@ -5,13 +5,15 @@ import copy
 import hashlib
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 
 from alp_schema_mcp.catalog import OPERATION_DEFS, ContractCatalog
 from jsonschema import Draft202012Validator
 
 from .catalog import Catalog, schema_children, stable_json
 from .errors import ALPError
+from .semantics import bind_state_precondition
 from .protocol import ALPOptions, OperationChoice
 from .task_constraints import constrain_payload
 
@@ -36,6 +38,11 @@ def _import_schema(body: dict, schema: dict) -> dict:
 
 
 
+@lru_cache(maxsize=2)
+def contracts_for(version):
+    return ContractCatalog(version)
+
+
 @dataclass(frozen=True)
 class CompiledProfile:
     digest: str
@@ -44,11 +51,17 @@ class CompiledProfile:
     grammar: str
     residual_checks: tuple[dict[str, str], ...]
     catalog: Catalog
+    protocol_version: str = "0.3.0"
+    member_schemas: tuple[dict, ...] = ()
+
+    @property
+    def contracts(self):
+        return contracts_for(self.protocol_version)
 
 
 
 class ContractCompiler:
-    compiler_identity = "semantic-router-alp/native-contract-1"
+    compiler_identity = "semantic-router-alp/native-contract-2"
 
     def __init__(
         self,
@@ -60,15 +73,35 @@ class ContractCompiler:
         self.cache_size = cache_size
         self._cache: OrderedDict[str, CompiledProfile] = OrderedDict()
         self._lock = threading.Lock()
+        self._versions = {}
         self.observed_definition = observed_definition or {}
 
 
     def compile(self, options: ALPOptions, catalog: Catalog) -> CompiledProfile:
+        # Separate compiler/cache instances prevent mixed-version request races.
+        if options.protocol_version != self.contracts.version:
+            with self._lock:
+                compiler = self._versions.get(options.protocol_version)
+                if compiler is None:
+                    compiler = type(self)(contracts_for(options.protocol_version),
+                                          self.cache_size, self.observed_definition)
+                    self._versions[options.protocol_version] = compiler
+            return compiler.compile(options, catalog)
+        # Contexts cross sorted JSON transports. Compile the same object order
+        # before and after transport so const-valued prefixes stay resumable.
+        catalog = Catalog.model_validate_json(stable_json(catalog.model_dump()))
+        reserved = self.contracts.resource_tools.get("resource.bindings.update")
+        if "resource.bindings.update" in catalog.tools:
+            tool = catalog.tools["resource.bindings.update"]
+            if not reserved or tool.input_schema != reserved["input_schema"] or tool.state_effect != reserved["state_effect"] or tool.external_effect != reserved["external_effect"]:
+                raise ALPError("INVALID_HOST_CATALOG", "The reserved resource management descriptor cannot be overridden.", 422)
         operations = tuple(op for op in OPERATION_DEFS if op in options.allowed_operations)
         if not set(operations).issubset(catalog.allowed_operations):
             raise ALPError("OPERATION_NOT_AVAILABLE", "An operation is outside this catalog.")
         if isinstance(options.choice, OperationChoice):
             operations = (options.choice.operation,)
+        from .response_constraints import validate_plan
+        validate_plan(options.protocol_version, operations, catalog)
         digest = hashlib.sha256(
             stable_json(
                 {
@@ -84,6 +117,11 @@ class ContractCompiler:
                 self._cache.move_to_end(digest)
                 return self._cache[digest]
             profile = self._compile(digest, operations, catalog)
+            from .response_constraints import member_catalog
+            if catalog.response_constraints and catalog.response_constraints.members:
+                profile = replace(profile, member_schemas=tuple(
+                    self._specialize(m.operation, member_catalog(catalog, i))
+                    for i, m in enumerate(catalog.response_constraints.members)))
             self._cache[digest] = profile
             if len(self._cache) > self.cache_size:
                 self._cache.popitem(last=False)
@@ -93,7 +131,7 @@ class ContractCompiler:
     def _compile(self, digest, operations, catalog):
         return CompiledProfile(
             digest, operations, {op: self._specialize(op, catalog) for op in operations},
-            "", (), catalog.model_copy(deep=True),
+            "", (), catalog.model_copy(deep=True), self.contracts.version,
         )
 
     def _specialize(self, operation: str, catalog: Catalog) -> dict:
@@ -142,6 +180,8 @@ class ContractCompiler:
                     payload["properties"]["arguments"] = _import_schema(
                         body, capability.input_schema
                     )
+                    bind_state_precondition(payload, effect=capability.state_effect,
+                                            version=agent.state_version, target="/agents/" + name + "/state_version")
                     variants.append(payload)
         elif operation == "list_agent_capabilities":
             if catalog.agents:
@@ -156,6 +196,8 @@ class ContractCompiler:
                     payload = copy.deepcopy(base)
                     payload["properties"]["tool"] = {"const": name}
                     payload["properties"]["arguments"] = _import_schema(body, argument_schema)
+                    bind_state_precondition(payload, effect=tool.state_effect,
+                                            version=catalog.current_state_version, target="/current_state_version")
                     variants.append(payload)
         elif operation == "agent_final":
             payload = copy.deepcopy(base)
@@ -175,7 +217,7 @@ class ContractCompiler:
         else:
             payload = copy.deepcopy(base)
             payload["properties"]["requested_tools"]["items"] = (
-                {"enum": list(catalog.tools)} if catalog.tools else False
+                {"enum": [t for t in catalog.tools if self.contracts.resource_tools.get(t, {}).get("delegatable", True)]} if any(self.contracts.resource_tools.get(t, {}).get("delegatable", True) for t in catalog.tools) else False
             )
             variants.append(payload)
         if not variants:
@@ -189,7 +231,7 @@ class ContractCompiler:
             from .definition_constraints import specialize_definition
 
             dependencies = catalog
-            if self.observed_definition:
+            if self.observed_definition and "actions" not in self.observed_definition:
                 from .catalog import PayloadConstraints
 
                 dependencies = catalog.model_copy(deep=True)

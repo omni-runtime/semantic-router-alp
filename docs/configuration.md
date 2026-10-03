@@ -61,9 +61,11 @@ every schema assertion. Unlike local token masks, these are provider requests.
 
 ## Validation and replay contract
 
-The worker accepts exactly one complete native function call. It rejects unknown
+The worker accepts one complete native function call in 0.3, or an atomic collection
+of 1–16 ordinary calls in opt-in 0.4. It rejects unknown
 operations, extra outer fields, duplicate JSON keys, nonfinite numbers,
-truncation, refusal, parallel calls and mixed explanatory content. Whitespace-only
+truncation, refusal, parallel calls in 0.3 and mixed explanatory content. See
+[0.4 result pairing and exclusive calls](protocol-04.md). Whitespace-only
 assistant content is framing; it is retained in private history and reported in
 `transport_whitespace_ignored`. Full canonical ALP, dynamic catalog and signed
 host constraints are checked after generation. The generation schema is also

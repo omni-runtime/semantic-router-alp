@@ -15,10 +15,14 @@
   },
   "contracts": {
     "repository": "https://github.com/omni-runtime/alp_schema_mcp.git",
+    "commit": "459257275b29865d3f60facb67283c8bfab1262e",
     "package_version": "0.3.0",
     "protocol_version": "0.3.0",
-    "draft_revision": 1,
-    "commit": "c2ced6e565fe430ef7d3ccb9d9fe61dc4e45c1c8"
+    "supported_protocol_versions": [
+      "0.3.0",
+      "0.4.0"
+    ],
+    "draft_revision": 1
   },
-  "composed_patch_sha256": "abe669f85cc00e191e7ef533e08d227972dd6d8f38c1c8c72c997a5f026bb448"
+  "composed_patch_sha256": "a001fc984ec592e94398f06b1cee4ab0c4729a2bc4059fccfb3aed940d8ba355"
 }

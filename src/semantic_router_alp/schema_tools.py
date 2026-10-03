@@ -80,21 +80,18 @@ def generation_schemas(
     if "properties" not in payload:
         return [result]
     properties = payload["properties"]
-    resources = properties["resource_requirements"]
+    resources = properties.get("resource_requirements", {})
     if "const" not in resources:
-        # Dependency compilation enumerates resource subsets. Keep generated
-        # declarations inside that supported domain instead of dead-ending
-        # only after the ninth resource has already been emitted.
-        resources["maxItems"] = min(resources.get("maxItems", 8), 8)
+        resources["maxItems"] = min(resources.get("maxItems", 16), 16)
     # Declare dependencies before capabilities, so the request-local matcher
     # can bind exact domains while decoding the rest of this same action.
     dependencies = ("resource_requirements", "requested_tools", "state_schema")
     payload["properties"] = {
-        **{k: properties[k] for k in dependencies},
+        **{k: properties[k] for k in dependencies if k in properties},
         **{k: v for k, v in properties.items() if k not in dependencies},
     }
     properties = payload["properties"]
-    payload["required"] = list(dict.fromkeys([*payload.get("required", []), *dependencies[:2]]))
+    payload["required"] = list(dict.fromkeys([*payload.get("required", []), *(k for k in dependencies[:2] if k in properties)]))
     # An operator may require an explicit output contract during sampling;
     # final ALP validation still accepts
     # legacy definitions which rely on the protocol's default output contract.
@@ -111,3 +108,57 @@ def generation_schemas(
     alternative = copy.deepcopy(result)
     alternative["properties"]["payload"] = late
     return [result, alternative]
+
+
+def generation_views(schema: dict, operation: str, *, codec="body", **options) -> list[dict]:
+    """One generation view for rendering and grammar, including codec envelope."""
+    if codec not in {"body", "tagged", "canonical"}:
+        raise ValueError("Unknown generation codec")
+    views = generation_schemas(schema, operation, **options)
+    if codec == "canonical":
+        for view in views:
+            props = view["properties"]
+            view["properties"] = {"protocol_version": props["protocol_version"],
+                                  "request_id": props["request_id"],
+                                  "operation": {"const": operation}, "payload": props["payload"]}
+            view["required"] = list(view["properties"])
+    return views
+
+
+def simplify_native_schema(schema: dict) -> dict:
+    """Inline small reference-only leaves without changing assertions or unions.
+
+    Never unfold recursion or overwrite $ref siblings. Walk schema positions only,
+    so JSON values inside const/enum/examples remain untouched.
+    """
+    result = copy.deepcopy(schema)
+    definitions = result.get("$defs", {})
+    for _ in range(8):
+        changed = False
+        def walk(node):
+            nonlocal changed
+            if not isinstance(node, dict):
+                return
+            ref = node.get("$ref", "")
+            if set(node) == {"$ref"} and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/"):].replace("~1", "/").replace("~0", "~")
+                target = definitions.get(name)
+                if isinstance(target, dict):
+                    pending = [target]
+                    recursive = False
+                    while pending:
+                        child = pending.pop()
+                        if isinstance(child, dict):
+                            recursive |= "$ref" in child or "$dynamicRef" in child or "$id" in child
+                            pending.extend(schema_children(child))
+                    from .catalog import stable_json
+                    if not recursive and len(stable_json(target)) <= 256:
+                        node.clear()
+                        node.update(copy.deepcopy(target))
+                        changed = True
+            for child in list(schema_children(node)):
+                walk(child)
+        walk(result)
+        if not changed:
+            break
+    return compact_schema(result, annotations=False)

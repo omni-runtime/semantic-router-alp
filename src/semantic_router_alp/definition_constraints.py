@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-import itertools
-
 from jsonschema import Draft202012Validator, ValidationError, validators
 
 from .errors import ALPError
@@ -40,12 +37,13 @@ def specialize_definition(body, catalog, contracts):
     fixed = constraints.fixed_values if constraints else {}
     tools = fixed.get("/requested_tools")
     resources = fixed.get("/resource_requirements")
-    allowed_tools = list(catalog.tools) if tools is None else tools
+    allowed_tools = [t for t in (list(catalog.tools) if tools is None else tools)
+                     if contracts.resource_tools.get(t, {}).get("delegatable", True)]
     execution = definitions["AgentExecution"]
     execution["properties"]["tool_subset"]["items"] = (
         {"enum": allowed_tools} if allowed_tools else False
     )
-    knowledge = list(contracts.resource_tools)
+    knowledge = [t for t in contracts.resource_tools if t.startswith("knowledge.")]
     # An agent_run using either knowledge tool necessarily selects a knowledge
     # resource, which requires both tools. This implication does not depend on
     # the resource slot names being known yet.
@@ -73,41 +71,18 @@ def specialize_definition(body, catalog, contracts):
         definitions["ResourceSubset"]["properties"]["slots"]["items"] = (
             {"enum": slots} if slots else False
         )
-        if len(slots) > 8:
-            raise ALPError("UNSUPPORTED_SCHEMA", "Strict capability dependencies support at most 8 resource slots.", 422)
-        # Select a resource subset and compile its exact tool dependencies in
-        # the same branch. Keep arbitrary array order within that subset.
-        executions = []
-        for flags in itertools.product((False, True), repeat=len(resources)):
-            selected = [r for r, flag in zip(resources, flags, strict=True) if flag]
-            selected_slots = [r["slot"] for r in selected]
-            knowledge_selected = any(r["kind"] == "knowledge" for r in selected)
-            mcp_owners = {t: r["slot"] for r in resources if r["kind"] == "mcp" for t in r["tool_allowlist"]}
-            possible = [t for t in allowed_tools if
-                        (t not in knowledge or knowledge_selected) and
-                        (t not in mcp_owners or mcp_owners[t] in selected_slots)]
-            if knowledge_selected and not set(knowledge).issubset(possible):
-                continue
-            branch = copy.deepcopy(execution)
-            branch["properties"]["tool_subset"] = {
-                "type": "array", "items": {"enum": possible} if possible else False,
-                "uniqueItems": True, "maxItems": len(possible),
-                "x-alp-required-items": knowledge if knowledge_selected else [],
-            }
-            branch["properties"]["resource_subset"] = {
-                "type": "object", "properties": {"slots": {
-                    "type": "array", "items": {"enum": selected_slots} if selected_slots else False,
-                    "minItems": len(selected_slots), "maxItems": len(selected_slots), "uniqueItems": True,
-                }}, "required": ["slots"], "additionalProperties": False,
-            }
-            if selected_slots:
-                branch["required"] = list(dict.fromkeys([*branch["required"], "resource_subset"]))
-            executions.append(branch)
-        definitions["AgentExecution"] = {"anyOf": executions}
+        # Resource/tool correlation is checked incrementally by the native
+        # dependency matcher and independently against the final document.
+        # Keep one symbolic domain instead of enumerating 2**len(resources).
+        definitions["ResourceSubset"]["properties"]["slots"].update(
+            maxItems=len(slots), uniqueItems=True, **{"x-alp-prefix-unique": True})
+        execution["properties"]["tool_subset"]["x-alp-prefix-unique"] = True
+        definitions["AgentExecution"] = execution
         declared = body["properties"]["payload"].get("properties", {}).get("requested_tools", {})
         if declared.get("type") == "array":
             needs_knowledge = any(r["kind"] == "knowledge" for r in resources)
-            candidates = [t for t in catalog.tools if t not in knowledge or needs_knowledge]
+            candidates = [t for t in catalog.tools if (t not in knowledge or needs_knowledge)
+                          and contracts.resource_tools.get(t, {}).get("delegatable", True)]
             needed = list(knowledge) if needs_knowledge else []
             for resource in resources:
                 if resource["kind"] == "mcp":
@@ -117,8 +92,9 @@ def specialize_definition(body, catalog, contracts):
                 raise ALPError("INVALID_TASK_CONSTRAINT", "Resource tools are unavailable.", 422)
             declared["items"] = {"enum": candidates} if candidates else False
             declared["x-alp-required-items"] = needed
+            declared["x-alp-prefix-unique"] = True
     if tools is not None and resources is not None:
-        knowledge = set(contracts.resource_tools)
+        knowledge = {t for t in contracts.resource_tools if t.startswith("knowledge.")}
         has_knowledge = any(r["kind"] == "knowledge" for r in resources)
         required = knowledge if has_knowledge else set()
         for resource in resources:
@@ -129,6 +105,28 @@ def specialize_definition(body, catalog, contracts):
                 "INVALID_TASK_CONSTRAINT", "Fixed tools and resources violate ALP dependencies.", 422
             )
     narrow_resources(body, catalog)
+    # Do not offer declarations whose mandatory tools are unavailable: such a
+    # prefix would dead-end when dependency decoding closes the resources array.
+    unavailable = set()
+    if not {"knowledge.search", "knowledge.read"}.issubset(allowed_tools):
+        unavailable.add("knowledge")
+    if not mcp_tools:
+        unavailable.add("mcp")
+    resource_union = definitions["ResourceRequirement"]
+    if isinstance(resource_union, dict):
+        names = {"KnowledgeRequirement": "knowledge", "MCPRequirement": "mcp"}
+        for union in ("oneOf", "anyOf"):
+            if union in resource_union:
+                branches = [branch for branch in resource_union[union]
+                            if names.get(branch.get("$ref", "").rsplit("/", 1)[-1],
+                                         branch.get("properties", {}).get("kind", {}).get("const")) not in unavailable]
+                if branches:
+                    resource_union[union] = branches
+                else:
+                    definitions["ResourceRequirement"] = False
+                    resource_array = body["properties"]["payload"]["properties"]["resource_requirements"]
+                    if "const" not in resource_array:
+                        resource_array.update(items=False, maxItems=0)
     # Correlate tool subsets, effects and registered handler contracts before
     # sampling; the model never supplies the trusted tool classification.
     capability = definitions["CapabilityDefinition"]
@@ -137,8 +135,8 @@ def specialize_definition(body, catalog, contracts):
     bind_capabilities(body, constraints, _DependencyValidator)
     payload = body["properties"]["payload"]
     tools_schema = payload.get("properties", {}).get("requested_tools", {})
-    if tools_schema.get("type") == "array" and set(contracts.resource_tools).issubset(catalog.tools):
-        tools_schema["x-alp-together"] = [list(contracts.resource_tools)]
+    if tools_schema.get("type") == "array" and {"knowledge.search", "knowledge.read"}.issubset(catalog.tools):
+        tools_schema["x-alp-together"] = [["knowledge.search", "knowledge.read"]]
     state_schema = fixed.get("/state_schema")
     if state_schema is not None:
         # state_schema precedes initial_state in the contract. Once emitted,
@@ -159,4 +157,46 @@ def specialize_definition(body, catalog, contracts):
                     "INVALID_TASK_CONSTRAINT", "A fixed definition field violates its dependencies.",
                     422, [{"path": "/payload" + path}],
                 )
+    # A completed resource selection narrows only that capability's later tools.
+    # Prefix items keep earlier capabilities resumable without enumerating 2**N
+    # resource subsets. Arrays and object order in the emitted prefix are retained.
+    selections = fixed.get('/capability_resources', {})
+    array = payload.get('properties', {}).get('exported_capabilities', {})
+    if selections and 'const' not in array:
+        import copy
+        prefix = []
+        generic = definitions['CapabilityDefinition']
+        by_slot = {r['slot']: r for r in resources or []}
+        owners = {t: {r['slot'] for r in resources or [] if r['kind'] == 'mcp' and t in r['tool_allowlist']}
+                  for r in resources or [] if r['kind'] == 'mcp' for t in r['tool_allowlist']}
+        for index in range(max(map(int, selections)) + 1):
+            selected = selections.get(str(index))
+            if selected is None:
+                prefix.append({'$ref': '#/$defs/CapabilityDefinition'})
+                continue
+            required = {'knowledge.search', 'knowledge.read'} if any(by_slot[s]['kind'] == 'knowledge' for s in selected) else set()
+            branches = []
+            for original in generic.get('anyOf', [generic]):
+                branch = copy.deepcopy(original)
+                run = branch.get('properties', {}).get('execution', {})
+                if 'tool_subset' not in run.get('properties', {}):
+                    continue
+                subset = run['properties']['tool_subset']
+                domain = subset.get('items', {})
+                allowed = domain.get('enum', []) if isinstance(domain, dict) else []
+                allowed = [t for t in allowed if (not t.startswith('knowledge.') or required)
+                           and (t not in owners or owners[t].intersection(selected))]
+                needed = set(subset.get('x-alp-required-items', [])) | required
+                highest = [t for t in subset.get('x-alp-any-items', []) if t in allowed]
+                if not needed.issubset(allowed) or subset.get('x-alp-any-items') and not highest:
+                    continue
+                subset.update(items={'enum': allowed} if allowed else False, maxItems=len(allowed),
+                              **{'x-alp-required-items': sorted(needed), 'x-alp-prefix-unique': True})
+                if highest:
+                    subset['x-alp-any-items'] = highest
+                branches.append(branch)
+            if not branches:
+                raise ALPError('INVALID_TASK_CONSTRAINT', 'Resource selection cannot satisfy capability effects.', 422)
+            prefix.append({'anyOf': branches})
+        array['prefixItems'] = prefix
     return body

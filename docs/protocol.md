@@ -59,8 +59,10 @@ Ordinary inference endpoints are unchanged when this integration is disabled.
 Set provider quirks only after verifying the selected backend. Qwen-compatible
 thinking mode may reject forced `tool_choice`; `enable_thinking: false` disables
 it for this ALP route. `allow_stop_tool_call` permits providers which return
-`stop` for a complete function call. It still requires exactly one valid call;
-empty output, text mixed with calls, refusal, truncation and parallel calls fail.
+`stop` for a complete function call. It requires a fully valid response: exactly
+one call in 0.3, or 1–16 ordinary calls in opt-in 0.4. Empty output, text mixed
+with calls, refusal and truncation fail; parallel calls also fail in 0.3.
+See [0.4 whole-response validation and result pairing](protocol-04.md).
 
 ## Request and validation
 

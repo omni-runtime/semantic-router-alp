@@ -66,6 +66,35 @@ def constrain_payload(body: dict, constraints: PayloadConstraints) -> dict:
         node["required"] = list(dict.fromkeys([*node.get("required", []), name]))
         return node
 
+    def forbid(node, parts, path):
+        node = resolve(copy.deepcopy(node), path)
+        for union in ("anyOf", "oneOf"):
+            if union in node:
+                branches = []
+                for branch in node[union]:
+                    try:
+                        branches.append(forbid(branch, parts, path))
+                    except ALPError:
+                        pass
+                if not branches:
+                    raise reject(path)
+                node[union] = branches
+                return node
+        name, *rest = parts
+        if node.get("type") != "object":
+            raise reject(path)
+        if name not in node.get("properties", {}):
+            if node.get("additionalProperties") is False:
+                return node
+            raise reject(path)
+        if rest:
+            node["properties"][name] = forbid(node["properties"][name], rest, path)
+        else:
+            if name in node.get("required", []):
+                raise reject(path)
+            node["properties"].pop(name)
+        return node
+
     original = copy.deepcopy(result["properties"]["payload"])
     payload = result["properties"]["payload"]
     for path in constraints.required_fields:
@@ -75,6 +104,9 @@ def constrain_payload(body: dict, constraints: PayloadConstraints) -> dict:
     for path, value in sorted(constraints.fixed_values.items(), key=lambda pair: -pair[0].count("/")):
         parts = [p.replace("~1", "/").replace("~0", "~") for p in path[1:].split("/")]
         payload = narrow(payload, parts, path, value)
+    for path in constraints.forbidden_fields:
+        parts = [p.replace("~1", "/").replace("~0", "~") for p in path[1:].split("/")]
+        payload = forbid(payload, parts, path)
     # Retain the original catalog assertion as well. In particular, narrowing
     # oneOf branches must not make an originally ambiguous value become valid.
     payload["allOf"] = [*payload.get("allOf", []), original]

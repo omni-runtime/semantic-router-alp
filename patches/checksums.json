@@ -1,3 +1,4 @@
 {
-  "0001-native-alp.patch": "47864f2e7d3c834c7828b0b37fa3eccb4cc482c0d6d9888af0569bd543be1057"
+  "0001-native-alp.patch": "47864f2e7d3c834c7828b0b37fa3eccb4cc482c0d6d9888af0569bd543be1057",
+  "0002-explicit-format-repair.patch": "af9a7501c0b1503197bf87448287f27360dea76676645f54aafcb3e331c3dd05"
 }

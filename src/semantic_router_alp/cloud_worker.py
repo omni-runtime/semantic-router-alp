@@ -8,8 +8,9 @@ import sys
 from pydantic import ValidationError
 
 from semantic_router_alp.catalog import ServerConfig
-from .cloud import CloudAdapter, strict_loads
 from semantic_router_alp.errors import ALPError
+
+from .cloud import CloudAdapter, strict_loads
 
 MAX_IPC_BYTES = 16 * 1024 * 1024
 
@@ -38,6 +39,8 @@ def main():
         output = {"ok": True, **result}
     except ALPError as exc:
         output = {"ok": False, "status": exc.status, **exc.envelope()}
+        if getattr(exc, "private_history", None) is not None:
+            output["history"] = exc.private_history
     except (ValueError, ValidationError, KeyError, TypeError, RecursionError, UnicodeError):
         output = {"ok": False, "status": 400, "error": {"code": "INVALID_REQUEST", "message": "Invalid ALP request."}}
     encoded = json.dumps(output, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()

@@ -18,8 +18,11 @@ def task_constraint_coverage(canonical, catalog):
     constraints = catalog.payload_constraints.get(operation)
     fixed = constraints.fixed_values if constraints else {}
     required = constraints.required_fields if constraints else []
+    forbidden = constraints.forbidden_fields if constraints else []
 
     def mode(path):
+        if any(path == p or path.startswith(p + "/") for p in forbidden):
+            return "forbidden"
         for parent in sorted(fixed, key=len, reverse=True):
             if path == parent:
                 return "fixed"
@@ -54,6 +57,7 @@ def task_constraint_coverage(canonical, catalog):
     return {
         "fixed_paths": sorted(fixed),
         "required_paths": sorted(required),
+        "forbidden_paths": sorted(forbidden),
         "key_fields": {path: mode(path) for path in paths},
         "capability_contracts": capabilities,
         "explicit_session_mode": operation == "agent_call" and catalog.explicit_session_mode,
@@ -94,11 +98,10 @@ def narrow_resources(body, catalog):
     definitions = body["$defs"]
     payload = body["properties"]["payload"]
     if catalog.environment_profiles is not None:
-        payload["properties"]["environment_profile_ref"] = (
-            {"enum": catalog.environment_profiles} if catalog.environment_profiles else False
-        )
-        if "default" not in catalog.environment_profiles:
-            payload["required"] = list(dict.fromkeys([*payload["required"], "environment_profile_ref"]))
+        if catalog.environment_profiles:
+            payload["properties"]["environment_profile_ref"] = {"enum": catalog.environment_profiles}
+        else:
+            payload["properties"].pop("environment_profile_ref", None)
     if catalog.resource_bindings is None:
         return
     names = {"knowledge": "KnowledgeRequirement", "skill": "SkillRequirement",
@@ -156,6 +159,10 @@ def capability_branches(base, definitions, catalog, contracts, fixed):
                 continue
             branch = copy.deepcopy(base)
             run = copy.deepcopy(execution)
+            # Selection precedes tools so invalid tool dependencies are masked
+            # before the model commits them, including optional empty subsets.
+            run["properties"] = {**{k: v for k, v in run["properties"].items() if k != "tool_subset"},
+                                 "tool_subset": run["properties"]["tool_subset"]}
             subset = run["properties"]["tool_subset"]
             subset.update(items={"enum": allowed} if allowed else False,
                           uniqueItems=True, maxItems=len(allowed))
@@ -220,6 +227,14 @@ def validate_host_contracts(canonical, catalog, contracts):
 
     constraints = catalog.payload_constraints.get(operation)
     if constraints:
+        for path in constraints.forbidden_fields:
+            value = payload
+            try:
+                for part in path[1:].split("/"):
+                    value = value[part.replace("~1", "/").replace("~0", "~")]
+            except (KeyError, TypeError):
+                continue
+            fail(path, "HOST_FORBIDDEN_FIELD")
         for path in set(constraints.required_fields) | constraints.fixed_values.keys():
             value = payload
             try:
@@ -245,7 +260,7 @@ def validate_host_contracts(canonical, catalog, contracts):
             fail("/arguments")
     if operation != "agent_definition_generate":
         return errors
-    if catalog.environment_profiles is not None and payload.get("environment_profile_ref", "default") not in catalog.environment_profiles:
+    if catalog.environment_profiles is not None and "environment_profile_ref" in payload and payload["environment_profile_ref"] not in catalog.environment_profiles:
         fail("/environment_profile_ref")
     if catalog.resource_bindings is not None:
         bindings = {b.slot: b for b in catalog.resource_bindings}

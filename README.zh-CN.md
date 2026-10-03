@@ -11,7 +11,8 @@ Semantic Router 的云端 ALP 扩展，独立维护原生 Function Calling 适�
 
 权威协议定义与校验来自私有仓库 `omni-runtime/alp_schema_mcp`。请自行取得访问权限，按
 `dependencies.lock.json` 安装对应提交。这里不分发该依赖源码或完整契约。
-包版本为 0.3.0，协议版本仍是 ALP 0.3.0 draft 1。
+依赖包版本仍为 0.3.0；锁定的提交同时包含 ALP 0.3 和 0.4 draft 1。
+默认使用 0.3，显式设置 `alp.protocol_version: "0.4.0"` 可启用整轮多调用，详见[版本与结果配对](docs/protocol-04.md)。
 
 ```bash
 python3.12 -m venv .venv
@@ -27,7 +28,8 @@ python -m pytest
 
 六种操作及函数名来自权威 transport-map。`api_json` 只解码一次 payload_json；`typed` 使用
 协议允许的静态投影。两者均恢复同一个 canonical 请求，再做完整协议、目录、动态参数与宿主约束校验。
-每回合只接受一个完整动作，不补字段、不执行动作、不将供应商 strict 开关等同于完整协议保证。
+0.3 每回合接受一个完整动作，0.4 接受 1～16 个普通调用并做整轮原子校验；final 与资源绑定更新必须独占本轮。
+不补字段、不执行动作、不将供应商 strict 开关等同于完整协议保证。
 SR 负责路由、云端凭据和私有历史；stdio worker 不发网络请求。实际授权、执行与持久 Run 属于宿主。
 
 ## 构建与测试
