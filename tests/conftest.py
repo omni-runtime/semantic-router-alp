@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from alp_schema_mcp.runtime.catalog import ServerConfig
-from alp_schema_mcp.runtime.constraints import ContractCompiler
-from alp_schema_mcp.runtime.protocol import ALPOptions
+from semantic_router_alp.catalog import ServerConfig
+from semantic_router_alp.constraints import ContractCompiler
+from semantic_router_alp.protocol import ALPOptions
 
 
 @pytest.fixture(scope="session")

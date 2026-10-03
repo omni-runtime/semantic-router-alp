@@ -7,9 +7,9 @@ import sys
 
 from pydantic import ValidationError
 
-from alp_schema_mcp.runtime.catalog import ServerConfig
+from semantic_router_alp.catalog import ServerConfig
 from .cloud import CloudAdapter, strict_loads
-from alp_schema_mcp.runtime.errors import ALPError
+from semantic_router_alp.errors import ALPError
 
 MAX_IPC_BYTES = 16 * 1024 * 1024
 

@@ -8,14 +8,14 @@ This document maps requirements to code and tests; it is not a deployment report
 | Requirement | Implementation | Verification |
 | --- | --- | --- |
 | Six authoritative function mappings | `CloudAdapter.prepare/complete`, ContractCatalog | Six-operation tests in `tests/test_cloud.py` |
-| Decode payload_json exactly once; validate canonical and dynamic arguments | `CloudAdapter.complete`, shared ALPParser | Bad payload, double encoding, wrong target and host binding tests |
+| Decode payload_json exactly once; validate canonical and dynamic arguments | `CloudAdapter.complete`, plugin-local ALPParser with canonical validation | Bad payload, double encoding, wrong target and host binding tests |
 | One parsing mode and one complete action | Native completion validation | Mixed content, parallel, empty, refusal and truncation tests |
 | Static typed projection preserves canonical meaning | `cloud_projection.py` | Raw equality, schema invariance and bound literal tests |
 | Separate provider call ID, internal call ID and request_id | Adapter context and private history | Exact paired-result tests |
 | Preserve required provider history privately | Adapter history plus SR ReplayStore | Reasoning retention; caller/catalog isolation and expiry tests |
 | Terminal acknowledgement without another generation | agent_final completion | Terminal pair and replay tests |
 | No execution or authorization from validation | Response flags; no executor | All operation responses have authorized/executed false |
-| Trusted task constraints cannot be supplied by model text | Shared signed host-task binding | Signature and task-drift tests |
+| Trusted task constraints cannot be supplied by model text | Plugin-local signed host-task binding | Signature and task-drift tests |
 | Buffer until complete validation before SSE success | SR `processor_alp.go` | `TestNativeALP` and deployed streaming/truncation tests |
 | Bound local IPC and environment; no provider secret in worker | SR `alptransport/worker.go` | Worker limits/timeout/environment tests |
 

@@ -9,17 +9,19 @@ Semantic Router 的云端 ALP 扩展，独立维护原生 Function Calling 适�
 
 ## 私有依赖
 
-协议与通用运行时来自私有仓库 `omni-runtime/alp_schema_mcp`。请自行取得访问权限，按
+权威协议定义与校验来自私有仓库 `omni-runtime/alp_schema_mcp`。请自行取得访问权限，按
 `dependencies.lock.json` 安装对应提交。这里不分发该依赖源码或完整契约。
-包版本为 0.3.1，协议版本仍是 ALP 0.3.0 draft 1。
+包版本为 0.3.0，协议版本仍是 ALP 0.3.0 draft 1。
 
 ```bash
 python3.12 -m venv .venv
 . .venv/bin/activate
-python -m pip install '/authorized/path/alp_schema_mcp[runtime]'
+python -m pip install '/authorized/path/alp_schema_mcp'
 python -m pip install -e '.[test]'
 python -m pytest
 ```
+
+目录特化、宿主任务绑定和请求校验辅助代码由本插件内部维护，不需要单独的 `alp-core` 仓库、包或服务。
 
 ## 协议边界
 

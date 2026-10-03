@@ -13,14 +13,14 @@ It is an independent integration project, not an official vLLM distribution.
 
 `omni-runtime/alp_schema_mcp` is a **private dependency**. Obtain access from its
 maintainers before installing. Its source and contract bundle are not distributed
-in this repository or public images. This project requires package version 0.3.1
+in this repository or public images. This project requires package version 0.3.0
 and ALP protocol 0.3.0 draft 1. It does not depend on `vllm-alp`, vLLM, MLX,
 XGrammar, PyTorch, a tokenizer or a GPU.
 
 ```bash
 python3.12 -m venv .venv
 . .venv/bin/activate
-python -m pip install '/authorized/path/alp_schema_mcp[runtime]'
+python -m pip install '/authorized/path/alp_schema_mcp'
 python -m pip install -e '.[test]'
 python -m pytest
 ```
@@ -34,8 +34,8 @@ belong in `inference-stack`'s private instance configuration.
 ## Contracts and boundaries
 
 The authoritative schema, operation map and native API envelope come from
-`alp_schema_mcp`; there is no vendored protocol copy. The shared engine-independent
-runtime specializes catalogs and trusted host requirements. This adapter projects
+`alp_schema_mcp`; there is no vendored protocol copy. Plugin-local helpers specialize catalogs and trusted host requirements.
+There is no separate alp-core package or service. This adapter projects
 those contracts into native cloud tools and validates exactly one completed call.
 The `api_json` projection decodes `payload_json` exactly once. The optional `typed`
 projection restores the same canonical ALP object without repairing model output.

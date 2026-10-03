@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import copy
 
-from alp_schema_mcp.runtime.catalog import stable_json
-from alp_schema_mcp.runtime.schema_tools import compact_schema, generation_schemas
+from semantic_router_alp.catalog import stable_json
+from semantic_router_alp.schema_tools import compact_schema, generation_schemas
 
 
 def _schema_children(node):

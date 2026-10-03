@@ -27,7 +27,7 @@ def main():
         assert re.fullmatch(r"[0-9a-f]{40}", lock[key]["commit"]), key
     assert re.fullmatch(r"[0-9a-f]{64}", lock["composed_patch_sha256"])
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    assert f"alp-schema-mcp[runtime]=={lock['contracts']['package_version']}" in project["dependencies"]
+    assert f"alp-schema-mcp=={lock['contracts']['package_version']}" in project["dependencies"]
     assert not any("vllm" in d or "xgrammar" in d for d in project["dependencies"])
     broken = []
     for path in ROOT.rglob("*"):
@@ -46,7 +46,7 @@ def main():
             if "src" in path.relative_to(ROOT).parts:
                 for node in ast.walk(tree):
                     names = [n.name for n in node.names] if isinstance(node, ast.Import) else ([node.module or ""] if isinstance(node, ast.ImportFrom) else [])
-                    assert not any(n.split(".")[0] in {"vllm_alp", "vllm", "mlx", "torch", "xgrammar"} for n in names), path
+                    assert not any(n.split(".")[0] in {"alp_core", "vllm_alp", "vllm", "mlx", "torch", "xgrammar"} for n in names), path
     assert not broken, "\n".join(broken)
     assert not (ROOT / "src/semantic_router_alp/contracts").exists()
     print("Public structure, links, syntax, dependency boundary and patch provenance passed.")

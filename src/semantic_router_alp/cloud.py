@@ -12,16 +12,16 @@ from jsonschema import Draft202012Validator
 from referencing import Registry
 from starlette.datastructures import Headers
 
-from alp_schema_mcp.runtime.catalog import Catalog, ServerConfig, stable_json
+from semantic_router_alp.catalog import Catalog, ServerConfig, stable_json
 from .cloud_projection import typed_arguments_schema
-from alp_schema_mcp.runtime.constraints import ContractCompiler
-from alp_schema_mcp.runtime.errors import ALPError
-from alp_schema_mcp.runtime.host_contracts import task_constraint_coverage, validation_scope
-from alp_schema_mcp.runtime.parser import ALPParser
-from alp_schema_mcp.runtime.protocol import ALPChatRequest
-from alp_schema_mcp.runtime.rendering import catalog_context
-from alp_schema_mcp.runtime.schema_tools import compact_schema, generation_schemas
-from alp_schema_mcp.runtime.task_context import TASK_HEADER, bind_task_constraints
+from semantic_router_alp.constraints import ContractCompiler
+from semantic_router_alp.errors import ALPError
+from semantic_router_alp.host_contracts import task_constraint_coverage, validation_scope
+from semantic_router_alp.parser import ALPParser
+from semantic_router_alp.protocol import ALPChatRequest
+from semantic_router_alp.rendering import catalog_context
+from semantic_router_alp.schema_tools import compact_schema, generation_schemas
+from semantic_router_alp.task_context import TASK_HEADER, bind_task_constraints
 
 
 # Canonical specialization is shared with local adapters, without engine imports.

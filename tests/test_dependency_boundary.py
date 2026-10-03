@@ -11,11 +11,11 @@ def test_cloud_import_and_compile_without_engine_imports():
 import importlib.abc, json, sys
 class NoEngine(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'vllm_alp', 'vllm', 'vllm_omni', 'mlx', 'mlx_serve_alp', 'xgrammar', 'torch', 'transformers'}:
+        if fullname.split('.')[0] in {'alp_core', 'vllm_alp', 'vllm', 'vllm_omni', 'mlx', 'mlx_serve_alp', 'xgrammar', 'torch', 'transformers'}:
             raise AssertionError('Forbidden cloud dependency: ' + fullname)
 sys.meta_path.insert(0, NoEngine())
 from semantic_router_alp.cloud import CloudAdapter
-from alp_schema_mcp.runtime.catalog import ServerConfig
+from semantic_router_alp.catalog import ServerConfig
 config = ServerConfig.from_file(sys.argv[1])
 adapter = CloudAdapter(config, projection='typed')
 request = {'model':'example', 'messages':[{'role':'user','content':'Finish.'}],

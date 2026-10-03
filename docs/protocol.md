@@ -64,7 +64,7 @@ empty output, text mixed with calls, refusal, truncation and parallel calls fail
 
 ## Request and validation
 
-Requests use the shared `alp_schema_mcp.runtime` ALP chat DTO (`model`, `messages`, `alp`, generation
+Requests use the plugin-local `semantic_router_alp` ALP chat DTO (`model`, `messages`, `alp`, generation
 controls). The six native function names come from `alp_schema_mcp`. The worker
 supports two operator-selected projections:
 
@@ -97,7 +97,7 @@ No tagged-content scanning, automatic tool execution,
 output repair or hidden model retry occurs. Successful responses have
 `alp.validated: true`, `alp.executed: false` and `alp.authorized: false`.
 
-Use `alp_schema_mcp.runtime.host_tasks.AgentCallTask` or `DefinitionTask` and
+Use `semantic_router_alp.host_tasks.AgentCallTask` or `DefinitionTask` and
 `host_task_headers(request, task, key=...)` for exact caller-owned task text,
 session modes, artifacts and capability interfaces. SR accepts the existing
 `x-alp-task-context` header, validates it before dispatch, and removes it before

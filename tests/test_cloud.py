@@ -8,9 +8,9 @@ from conftest import PAYLOADS, canonical
 from conftest import body
 
 from semantic_router_alp.cloud import CloudAdapter
-from alp_schema_mcp.runtime.errors import ALPError
-from alp_schema_mcp.runtime.host_tasks import AgentCallTask, host_task_headers
-from alp_schema_mcp.runtime.protocol import ALPChatRequest
+from semantic_router_alp.errors import ALPError
+from semantic_router_alp.host_tasks import AgentCallTask, host_task_headers
+from semantic_router_alp.protocol import ALPChatRequest
 
 
 def native(adapter, operation="agent_call", payload=None):
