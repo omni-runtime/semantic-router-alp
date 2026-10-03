@@ -1,0 +1,24 @@
+{
+  "upstream": {
+    "repository": "https://github.com/vllm-project/semantic-router.git",
+    "commit": "5aa0145eb16ddf7edcc40a87793f61260e8c5084",
+    "patch_version": "0.1.0",
+    "go": "1.25.0",
+    "config_schema": "v0.3"
+  },
+  "multimodal": {
+    "repository": "https://github.com/omni-runtime/semantic-router-multimodal.git",
+    "commit": "b794a9e868bb9d930869d50c813c8d66c1e26a45",
+    "patches": {
+      "0001-native-multimodal.patch": "75c6573ad52af184c6a992f66b513caa6bfb919b08e2e9691514196b8b424334"
+    }
+  },
+  "contracts": {
+    "repository": "https://github.com/omni-runtime/alp_schema_mcp.git",
+    "package_version": "0.3.1",
+    "protocol_version": "0.3.0",
+    "draft_revision": 1,
+    "commit": "d847c8a31036efa61b21c00bcdf05628c4719e5c"
+  },
+  "composed_patch_sha256": "abe669f85cc00e191e7ef533e08d227972dd6d8f38c1c8c72c997a5f026bb448"
+}

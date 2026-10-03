@@ -1,0 +1,6 @@
+semantic-router-alp
+Copyright 2026 omni-runtime contributors.
+
+The SR integration is derived from vLLM Semantic Router and the omni-runtime
+integration work. Upstream source remains under its own licenses. Private
+alp_schema_mcp dependencies are not relicensed or distributed by this project.

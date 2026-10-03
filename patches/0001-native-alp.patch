@@ -1,0 +1,1088 @@
+diff --git a/config/config.yaml b/config/config.yaml
+index c527df06d..3562c5bc1 100644
+--- a/config/config.yaml
++++ b/config/config.yaml
+@@ -2313,6 +2313,13 @@ global:
+         table_name: vector_store_registry
+ 
+   integrations:
++    # Native ALP Function Calling uses an operator-installed private contract worker.
++    alp:
++      enabled: false
++      command: []
++      worker_env: []
++      timeout_milliseconds: 10000
++      models: {}
+     tools:
+       enabled: true
+       top_k: 5
+diff --git a/src/semantic-router/pkg/alptransport/history.go b/src/semantic-router/pkg/alptransport/history.go
+new file mode 100644
+index 000000000..4ea3158a2
+--- /dev/null
++++ b/src/semantic-router/pkg/alptransport/history.go
+@@ -0,0 +1,65 @@
++package alptransport
++
++import (
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"sync"
++	"time"
++)
++
++// ReplayStore holds provider-only messages. Tokens are scoped to the authenticated
++// caller, logical model and catalog; expiration or process restart fails closed.
++type ReplayStore struct {
++	mu      sync.Mutex
++	entries map[string]replayEntry
++	bytes   int
++}
++type replayEntry struct {
++	scope   string
++	history json.RawMessage
++	expires time.Time
++}
++
++var errHistoryLimit = errors.New("ALP replay store capacity exceeded")
++
++const maxHistoryBytes = 32 * 1024 * 1024
++
++func (s *ReplayStore) Get(token, scope string) (json.RawMessage, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	e, ok := s.entries[token]
++	if !ok || e.scope != scope || !time.Now().Before(e.expires) {
++		return nil, false
++	}
++	return append(json.RawMessage(nil), e.history...), true
++}
++
++func (s *ReplayStore) Put(scope string, history json.RawMessage) (string, error) {
++	if len(history) > 8*1024*1024 {
++		return "", errHistoryLimit
++	}
++	var id [32]byte
++	if _, err := rand.Read(id[:]); err != nil {
++		return "", err
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.entries == nil {
++		s.entries = make(map[string]replayEntry)
++	}
++	for key, entry := range s.entries {
++		if !time.Now().Before(entry.expires) {
++			s.bytes -= len(entry.history)
++			delete(s.entries, key)
++		}
++	}
++	if len(s.entries) >= 256 || s.bytes+len(history) > maxHistoryBytes {
++		return "", errHistoryLimit
++	}
++	token := hex.EncodeToString(id[:])
++	s.entries[token] = replayEntry{scope, append(json.RawMessage(nil), history...), time.Now().Add(30 * time.Minute)}
++	s.bytes += len(history)
++	return token, nil
++}
+diff --git a/src/semantic-router/pkg/alptransport/worker.go b/src/semantic-router/pkg/alptransport/worker.go
+new file mode 100644
+index 000000000..0a69c240a
+--- /dev/null
++++ b/src/semantic-router/pkg/alptransport/worker.go
+@@ -0,0 +1,90 @@
++// Package alptransport bridges SR to an operator-installed authoritative ALP validator.
++// It contains no private ALP schemas, provider HTTP client, or action executor.
++package alptransport
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"time"
++
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
++)
++
++const MaxBytes = 16 * 1024 * 1024
++
++var slots = make(chan struct{}, 8)
++
++type Result struct {
++	OK       bool            `json:"ok"`
++	Status   int             `json:"status"`
++	Error    json.RawMessage `json:"error"`
++	Body     json.RawMessage `json:"body"`
++	Context  json.RawMessage `json:"context"`
++	Response json.RawMessage `json:"response"`
++	History  json.RawMessage `json:"history"`
++	Stream   bool            `json:"stream"`
++}
++
++type boundedOutput struct{ bytes.Buffer }
++
++func (b *boundedOutput) Write(p []byte) (int, error) {
++	if b.Len()+len(p) > MaxBytes {
++		return 0, errors.New("ALP worker output limit")
++	}
++	return b.Buffer.Write(p)
++}
++
++func Run(ctx context.Context, cfg config.ALPIntegrationConfig, input any) (Result, error) {
++	var result Result
++	if !cfg.Enabled || len(cfg.Command) == 0 || !filepath.IsAbs(cfg.Command[0]) {
++		return result, errors.New("ALP worker is not configured with an absolute executable")
++	}
++	timeout := cfg.TimeoutMilliseconds
++	if timeout == 0 {
++		timeout = 10000
++	}
++	if timeout < 100 || timeout > 60000 {
++		return result, errors.New("ALP worker timeout is invalid")
++	}
++	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Millisecond)
++	defer cancel()
++	select {
++	case slots <- struct{}{}:
++		defer func() { <-slots }()
++	case <-ctx.Done():
++		return result, ctx.Err()
++	}
++	body, err := json.Marshal(input)
++	if err != nil || len(body) > MaxBytes {
++		return result, errors.New("ALP worker input limit")
++	}
++	// #nosec G204 -- argv comes only from operator configuration, never from HTTP or model input.
++	cmd := exec.CommandContext(ctx, cfg.Command[0], cfg.Command[1:]...)
++	// Provider credentials and the router environment are not inherited.
++	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "PYTHONUNBUFFERED=1", "PYTHONDONTWRITEBYTECODE=1"}
++	for _, key := range cfg.WorkerEnv {
++		if value, ok := os.LookupEnv(key); ok {
++			cmd.Env = append(cmd.Env, key+"="+value)
++		}
++	}
++	cmd.Stdin = bytes.NewReader(body)
++	var stdout boundedOutput
++	cmd.Stdout, cmd.Stderr = &stdout, io.Discard
++	cmd.WaitDelay = time.Second
++	if err := cmd.Run(); err != nil {
++		return result, errors.New("ALP worker unavailable")
++	}
++	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
++		return result, errors.New("invalid ALP worker response")
++	}
++	if !result.OK && (result.Status < 400 || result.Status > 599 || len(result.Error) == 0) {
++		return result, errors.New("invalid ALP worker error")
++	}
++	return result, nil
++}
+diff --git a/src/semantic-router/pkg/alptransport/worker_test.go b/src/semantic-router/pkg/alptransport/worker_test.go
+new file mode 100644
+index 000000000..214c6f69c
+--- /dev/null
++++ b/src/semantic-router/pkg/alptransport/worker_test.go
+@@ -0,0 +1,77 @@
++package alptransport
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
++)
++
++func TestWorkerProcess(t *testing.T) {
++	if os.Getenv("ALP_WORKER_TEST") != "1" {
++		return
++	}
++	var input map[string]any
++	_ = json.NewDecoder(os.Stdin).Decode(&input)
++	if input["action"] == "wait" {
++		time.Sleep(time.Minute)
++	}
++	if os.Getenv("PROVIDER_API_KEY") != "" {
++		os.Exit(3)
++	}
++	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "body": map[string]any{"model": "cloud-test"}})
++	os.Exit(0)
++}
++
++func TestALPWorkerBoundaries(t *testing.T) {
++	t.Setenv("ALP_WORKER_TEST", "1")
++	t.Setenv("PROVIDER_API_KEY", "must-not-leak")
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	cfg := config.ALPIntegrationConfig{Enabled: true, Command: []string{exe, "-test.run=^TestWorkerProcess$"}, WorkerEnv: []string{"ALP_WORKER_TEST"}, TimeoutMilliseconds: 1000}
++	result, err := Run(context.Background(), cfg, map[string]any{"action": "prepare"})
++	if err != nil || !result.OK {
++		t.Fatalf("worker failed: %v", err)
++	}
++	cfg.TimeoutMilliseconds = 100
++	if _, err := Run(context.Background(), cfg, map[string]any{"action": "wait"}); err == nil {
++		t.Fatal("worker must time out")
++	}
++	cfg.Command = []string{"relative-command"}
++	if _, err := Run(context.Background(), cfg, map[string]any{}); err == nil {
++		t.Fatal("relative executable accepted")
++	}
++}
++
++func TestALPReplayIsolationExpiryAndCopies(t *testing.T) {
++	var store ReplayStore
++	body := json.RawMessage(`{"messages":[{"role":"assistant","reasoning":"private"}]}`)
++	token, err := store.Put("caller-model-catalog", body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	body[0] = 'X'
++	if _, ok := store.Get(token, "different-caller"); ok {
++		t.Fatal("cross-caller replay accepted")
++	}
++	got, ok := store.Get(token, "caller-model-catalog")
++	if !ok || got[0] != '{' {
++		t.Fatal("history mutated")
++	}
++	got[0] = 'X'
++	again, _ := store.Get(token, "caller-model-catalog")
++	if again[0] != '{' {
++		t.Fatal("get exposed mutable history")
++	}
++	entry := store.entries[token]
++	entry.expires = time.Now().Add(-time.Second)
++	store.entries[token] = entry
++	if _, ok := store.Get(token, "caller-model-catalog"); ok {
++		t.Fatal("expired state accepted")
++	}
++}
+diff --git a/src/semantic-router/pkg/config/alp.go b/src/semantic-router/pkg/config/alp.go
+new file mode 100644
+index 000000000..a9dedc097
+--- /dev/null
++++ b/src/semantic-router/pkg/config/alp.go
+@@ -0,0 +1,17 @@
++package config
++
++// ALPIntegrationConfig enables the native Function Calling transport edge.
++// The command is operator-owned and receives JSON on stdin; it never dispatches HTTP.
++type ALPIntegrationConfig struct {
++	Enabled             bool                      `yaml:"enabled,omitempty" json:"enabled,omitempty"`
++	Command             []string                  `yaml:"command,omitempty" json:"command,omitempty"`
++	WorkerEnv           []string                  `yaml:"worker_env,omitempty" json:"worker_env,omitempty"`
++	TimeoutMilliseconds int                       `yaml:"timeout_milliseconds,omitempty" json:"timeout_milliseconds,omitempty"`
++	Models              map[string]ALPModelPolicy `yaml:"models,omitempty" json:"models,omitempty"`
++}
++
++// ALPModelPolicy pins provider quirks to explicitly enabled concrete models.
++type ALPModelPolicy struct {
++	EnableThinking    *bool `yaml:"enable_thinking,omitempty" json:"enable_thinking,omitempty"`
++	AllowStopToolCall bool  `yaml:"allow_stop_tool_call,omitempty" json:"allow_stop_tool_call,omitempty"`
++}
+diff --git a/src/semantic-router/pkg/config/alp_test.go b/src/semantic-router/pkg/config/alp_test.go
+new file mode 100644
+index 000000000..24bc46497
+--- /dev/null
++++ b/src/semantic-router/pkg/config/alp_test.go
+@@ -0,0 +1,41 @@
++package config
++
++import (
++	"testing"
++
++	"gopkg.in/yaml.v2"
++)
++
++func TestALPCanonicalRoundTrip(t *testing.T) {
++	var global CanonicalGlobal
++	if err := yaml.Unmarshal([]byte(`integrations:
++  alp:
++    enabled: true
++    command: [/opt/alp/bin/python, -m, semantic_router_alp.cloud_worker, --config, /etc/alp/catalogs.json]
++    worker_env: [ALP_HOST_TASK_KEY]
++    timeout_milliseconds: 5000
++    models:
++      cloud/chat:
++        enable_thinking: false
++        allow_stop_tool_call: true
++`), &global); err != nil {
++		t.Fatal(err)
++	}
++	var runtime RouterConfig
++	applyCanonicalIntegrationGlobal(&runtime, global.Integrations)
++	if !runtime.ALP.Enabled || len(runtime.ALP.Command) != 5 {
++		t.Fatal("ALP config lost")
++	}
++	policy := runtime.ALP.Models["cloud/chat"]
++	if policy.EnableThinking == nil || *policy.EnableThinking || !policy.AllowStopToolCall {
++		t.Fatal("provider policy lost")
++	}
++	encoded, err := yaml.Marshal(global)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var replay CanonicalGlobal
++	if err := yaml.Unmarshal(encoded, &replay); err != nil || !replay.Integrations.ALP.Enabled {
++		t.Fatal("canonical replay failed")
++	}
++}
+diff --git a/src/semantic-router/pkg/config/canonical_export.go b/src/semantic-router/pkg/config/canonical_export.go
+index 5c34cf6cf..bcbbe2609 100644
+--- a/src/semantic-router/pkg/config/canonical_export.go
++++ b/src/semantic-router/pkg/config/canonical_export.go
+@@ -336,6 +336,7 @@ func CanonicalGlobalFromRouterConfig(cfg *RouterConfig) *CanonicalGlobal {
+ 			VectorStore:   cloneVectorStoreConfig(cfg.VectorStore),
+ 		},
+ 		Integrations: CanonicalIntegrationGlobal{
++			ALP:    cfg.ALP,
+ 			Tools:  cfg.Tools,
+ 			Looper: cfg.Looper,
+ 		},
+diff --git a/src/semantic-router/pkg/config/canonical_global.go b/src/semantic-router/pkg/config/canonical_global.go
+index cf69c54aa..25c1b6147 100644
+--- a/src/semantic-router/pkg/config/canonical_global.go
++++ b/src/semantic-router/pkg/config/canonical_global.go
+@@ -64,8 +64,9 @@ type CanonicalStoreGlobal struct {
+ 
+ // CanonicalIntegrationGlobal groups external helper services used by the router.
+ type CanonicalIntegrationGlobal struct {
+-	Tools  ToolsConfig  `yaml:"tools"`
+-	Looper LooperConfig `yaml:"looper"`
++	ALP    ALPIntegrationConfig `yaml:"alp,omitempty"`
++	Tools  ToolsConfig          `yaml:"tools"`
++	Looper LooperConfig         `yaml:"looper"`
+ }
+ 
+ // CanonicalModelCatalog groups router-owned model assets and the module
+@@ -410,6 +411,7 @@ func applyCanonicalStoreGlobal(cfg *RouterConfig, stores CanonicalStoreGlobal) {
+ }
+ 
+ func applyCanonicalIntegrationGlobal(cfg *RouterConfig, integrations CanonicalIntegrationGlobal) {
++	cfg.ALP = integrations.ALP
+ 	cfg.Tools = integrations.Tools
+ 	cfg.Looper = integrations.Looper
+ }
+diff --git a/src/semantic-router/pkg/config/config.go b/src/semantic-router/pkg/config/config.go
+index f3ed7289b..a2f8fa713 100644
+--- a/src/semantic-router/pkg/config/config.go
++++ b/src/semantic-router/pkg/config/config.go
+@@ -122,12 +122,13 @@ type RouterConfig struct {
+ 	InlineModels     `yaml:",inline"`
+ 	ExternalModels   []ExternalModelConfig `yaml:"external_models,omitempty"`
+ 	SemanticCache    `yaml:"semantic_cache"`
+-	Memory           MemoryConfig        `yaml:"memory"`
+-	VectorStore      *VectorStoreConfig  `yaml:"vector_store,omitempty"`
+-	ResponseAPI      ResponseAPIConfig   `yaml:"response_api"`
+-	RouterReplay     RouterReplayConfig  `yaml:"router_replay"`
+-	StartupStatus    StartupStatusConfig `yaml:"startup_status"`
+-	Looper           LooperConfig        `yaml:"looper,omitempty"`
++	Memory           MemoryConfig         `yaml:"memory"`
++	VectorStore      *VectorStoreConfig   `yaml:"vector_store,omitempty"`
++	ResponseAPI      ResponseAPIConfig    `yaml:"response_api"`
++	RouterReplay     RouterReplayConfig   `yaml:"router_replay"`
++	StartupStatus    StartupStatusConfig  `yaml:"startup_status"`
++	ALP              ALPIntegrationConfig `yaml:"alp,omitempty"`
++	Looper           LooperConfig         `yaml:"looper,omitempty"`
+ 	LLMObservability `yaml:",inline"`
+ 	APIServer        `yaml:",inline"`
+ 	RouterOptions    `yaml:",inline"`
+diff --git a/src/semantic-router/pkg/configschema/router-config-v0.3.schema.json b/src/semantic-router/pkg/configschema/router-config-v0.3.schema.json
+index ef1a11770..8a6dbefda 100644
+--- a/src/semantic-router/pkg/configschema/router-config-v0.3.schema.json
++++ b/src/semantic-router/pkg/configschema/router-config-v0.3.schema.json
+@@ -2,6 +2,48 @@
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "$id": "https://vllm-sr.ai/schemas/router-config-v0.3.schema.json",
+   "$defs": {
++    "ALPIntegrationConfig": {
++      "properties": {
++        "enabled": {
++          "type": "boolean"
++        },
++        "command": {
++          "items": {
++            "type": "string"
++          },
++          "type": "array"
++        },
++        "worker_env": {
++          "items": {
++            "type": "string"
++          },
++          "type": "array"
++        },
++        "timeout_milliseconds": {
++          "type": "integer"
++        },
++        "models": {
++          "additionalProperties": {
++            "$ref": "#/$defs/ALPModelPolicy"
++          },
++          "type": "object"
++        }
++      },
++      "additionalProperties": false,
++      "type": "object"
++    },
++    "ALPModelPolicy": {
++      "properties": {
++        "enable_thinking": {
++          "type": "boolean"
++        },
++        "allow_stop_tool_call": {
++          "type": "boolean"
++        }
++      },
++      "additionalProperties": false,
++      "type": "object"
++    },
+     "APIConfig": {
+       "properties": {
+         "embeddings": {
+@@ -753,6 +795,9 @@
+     },
+     "CanonicalIntegrationGlobal": {
+       "properties": {
++        "alp": {
++          "$ref": "#/$defs/ALPIntegrationConfig"
++        },
+         "tools": {
+           "$ref": "#/$defs/ToolsConfig"
+         },
+@@ -7924,6 +7969,15 @@
+           "vector_store"
+         ]
+       },
++      {
++        "key": "alp",
++        "layer": "integrations",
++        "display_name": "Alp",
++        "path": [
++          "integrations",
++          "alp"
++        ]
++      },
+       {
+         "key": "tools",
+         "layer": "integrations",
+diff --git a/src/semantic-router/pkg/extproc/fallback_dispatch.go b/src/semantic-router/pkg/extproc/fallback_dispatch.go
+index c6ed9a967..4b3a9c4c7 100644
+--- a/src/semantic-router/pkg/extproc/fallback_dispatch.go
++++ b/src/semantic-router/pkg/extproc/fallback_dispatch.go
+@@ -100,6 +100,9 @@ func (r *OpenAIRouter) recordPrimarySuccess(ctx *RequestContext) {
+ 
+ // shouldAttemptFallback reports whether fallback evaluation should be attempted for the request context.
+ func (r *OpenAIRouter) shouldAttemptFallback(ctx *RequestContext) bool {
++	if ctx != nil && ctx.alpBinding != nil {
++		return false
++	}
+ 	orch := r.fallbackOrchestratorForContext(ctx)
+ 	if r == nil || orch == nil || ctx == nil || ctx.SemanticRequest == nil {
+ 		return false
+diff --git a/src/semantic-router/pkg/extproc/processor_alp.go b/src/semantic-router/pkg/extproc/processor_alp.go
+new file mode 100644
+index 000000000..196498d07
+--- /dev/null
++++ b/src/semantic-router/pkg/extproc/processor_alp.go
+@@ -0,0 +1,224 @@
++package extproc
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"strconv"
++	"strings"
++
++	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++	http_ext "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
++	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
++	"github.com/tidwall/sjson"
++
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/alptransport"
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
++)
++
++type alpRequestBinding struct {
++	context       json.RawMessage
++	scope         string
++	stream        bool
++	policy        config.ALPModelPolicy
++	expectedModel string
++}
++
++var alpReplay alptransport.ReplayStore
++
++// Inspect raw headers before the map representation can discard duplicates.
++// Comma-coalesced copies are invalid too: these fields are singleton tokens.
++func duplicateALPHeader(v *ext_proc.ProcessingRequest_RequestHeaders) bool {
++	seen := map[string]bool{}
++	for _, h := range v.RequestHeaders.Headers.Headers {
++		key := strings.ToLower(h.Key)
++		if key != "x-alp-task-context" && key != "x-alp-provider-state" && key != "authorization" {
++			continue
++		}
++		if seen[key] || strings.Contains(extractHeaderValue(h), ",") {
++			return true
++		}
++		seen[key] = true
++	}
++	return false
++}
++
++func (r *OpenAIRouter) prepareALPRequest(body []byte, ctx *RequestContext) ([]byte, *ext_proc.ProcessingResponse) {
++	if normalizeRequestPath(ctx.Headers[":path"]) != "/v1/alp/chat/completions" {
++		return body, nil
++	}
++	if r.Config == nil || !r.Config.ALP.Enabled {
++		return nil, r.createErrorResponse(404, "ALP transport is disabled")
++	}
++	if ctx.SkipProcessing || len(body) > 8*1024*1024 {
++		return nil, r.createErrorResponse(400, "invalid ALP transport request")
++	}
++	var identity struct {
++		Model  string `json:"model"`
++		Stream bool   `json:"stream"`
++		ALP    struct {
++			Catalog string `json:"catalog_ref"`
++		} `json:"alp"`
++	}
++	if json.Unmarshal(body, &identity) != nil {
++		return nil, r.createErrorResponse(400, "invalid ALP request")
++	}
++	_, enabledModel := r.Config.ALP.Models[identity.Model]
++	if !enabledModel && !r.requestModelActsAsAuto(identity.Model) {
++		return nil, r.createErrorResponse(400, "ALP requires a public entrypoint or an explicitly enabled model")
++	}
++	auth := headerValueCI(ctx, "authorization")
++	if auth == "" {
++		return nil, r.createErrorResponse(401, "ALP requires caller authentication for private replay")
++	}
++	scopeBytes, _ := json.Marshal([]string{auth, identity.Model, identity.ALP.Catalog, fmt.Sprint(r.Config.ALP.Command)})
++	digest := sha256.Sum256(scopeBytes)
++	scope := hex.EncodeToString(digest[:])
++	input := map[string]any{"action": "prepare", "body": string(body), "headers": map[string]string{}}
++	expectedModel := ""
++	if value := headerValueCI(ctx, "x-alp-task-context"); value != "" {
++		input["headers"] = map[string]string{"x-alp-task-context": value}
++	}
++	if token := headerValueCI(ctx, "x-alp-provider-state"); token != "" {
++		history, ok := alpReplay.Get(token, scope)
++		if !ok {
++			return nil, r.createErrorResponse(409, "ALP provider state is expired or belongs to another caller, model or catalog")
++		}
++		var saved struct {
++			Model   string          `json:"model"`
++			History json.RawMessage `json:"history"`
++		}
++		if json.Unmarshal(history, &saved) != nil || saved.Model == "" || len(saved.History) == 0 {
++			return nil, r.createErrorResponse(409, "invalid ALP provider state")
++		}
++		expectedModel = saved.Model
++		input["history"] = saved.History
++	}
++	result, err := alptransport.Run(selectionRequestContext(ctx), r.Config.ALP, input)
++	if err != nil {
++		return nil, r.createErrorResponse(503, "ALP contract worker unavailable")
++	}
++	if !result.OK {
++		return nil, r.alpWorkerError(result)
++	}
++	if len(result.Context) == 0 || len(result.Body) == 0 {
++		return nil, r.createErrorResponse(503, "invalid ALP worker projection")
++	}
++	ctx.alpBinding = &alpRequestBinding{context: result.Context, scope: scope, stream: identity.Stream, expectedModel: expectedModel}
++	ctx.CacheReadBypass, ctx.CacheWriteBypass = true, true
++	ctx.ExpectStreamingResponse = false // Provider response is buffered until validation.
++	return result.Body, nil
++}
++
++func (r *OpenAIRouter) alpWorkerError(result alptransport.Result) *ext_proc.ProcessingResponse {
++	body, _ := json.Marshal(map[string]json.RawMessage{"error": result.Error})
++	return r.createJSONResponseWithBody(result.Status, body, headers.ResponsePathError)
++}
++
++func (r *OpenAIRouter) adaptALPDispatch(body []byte, dispatch *providerDispatch, ctx *RequestContext) ([]byte, error) {
++	if ctx == nil || ctx.alpBinding == nil {
++		return body, nil
++	}
++	if dispatch == nil || dispatch.targetFormat != llmprotocol.OpenAIChatV1 {
++		return nil, fmt.Errorf("ALP requires an OpenAI Chat Function Calling backend")
++	}
++	policy, ok := r.Config.ALP.Models[dispatch.logicalModel]
++	if !ok {
++		return nil, fmt.Errorf("selected model is not enabled for ALP")
++	}
++	if ctx.alpBinding.expectedModel != "" && ctx.alpBinding.expectedModel != dispatch.logicalModel {
++		return nil, fmt.Errorf("ALP replay cannot switch the provider model")
++	}
++	ctx.alpBinding.policy = policy
++	var err error
++	if policy.EnableThinking != nil {
++		body, err = sjson.SetBytes(body, "enable_thinking", *policy.EnableThinking)
++	}
++	if err != nil {
++		return nil, err
++	}
++	// The compatible Qwen endpoint consumes max_tokens, not max_completion_tokens.
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(body, &fields); err != nil {
++		return nil, err
++	}
++	if value, ok := fields["max_completion_tokens"]; ok {
++		fields["max_tokens"] = value
++		delete(fields, "max_completion_tokens")
++	}
++	return json.Marshal(fields)
++}
++
++func (r *OpenAIRouter) handleALPResponseBody(body []byte, ctx *RequestContext) (response *ext_proc.ProcessingResponse) {
++	defer func() {
++		// ALP explicitly buffers the provider body. Change the buffered status and
++		// body together; an ImmediateResponse after headers can reset the stream.
++		if immediate := response.GetImmediateResponse(); immediate != nil {
++			mutation := &ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}, SetHeaders: []*core.HeaderValueOption{
++				{Header: &core.HeaderValue{Key: ":status", RawValue: []byte(strconv.Itoa(int(immediate.GetStatus().GetCode())))}},
++				{Header: &core.HeaderValue{Key: "content-type", RawValue: []byte("application/json")}},
++			}}
++			response = buildResponseBodyContinueResponse(&ext_proc.BodyMutation{Mutation: &ext_proc.BodyMutation_Body{Body: immediate.Body}}, mutation)
++		}
++	}()
++	if ctx.UpstreamStatusCode < 200 || ctx.UpstreamStatusCode >= 300 {
++		return r.createErrorResponse(ctx.UpstreamStatusCode, "ALP provider request failed")
++	}
++	result, err := alptransport.Run(selectionRequestContext(ctx), r.Config.ALP, map[string]any{
++		"action": "complete", "body": string(body), "context": ctx.alpBinding.context,
++		"allow_stop_tool_call": ctx.alpBinding.policy.AllowStopToolCall,
++	})
++	if err != nil {
++		return r.createErrorResponse(503, "ALP contract worker unavailable")
++	}
++	if !result.OK {
++		return r.alpWorkerError(result)
++	}
++	if len(result.Response) == 0 || len(result.History) == 0 {
++		return r.createErrorResponse(502, "incomplete ALP worker response")
++	}
++	saved, err := json.Marshal(map[string]any{"model": ctx.RequestModel, "history": result.History})
++	if err != nil {
++		return r.createErrorResponse(502, "invalid ALP provider history")
++	}
++	token, err := alpReplay.Put(ctx.alpBinding.scope, saved)
++	if err != nil {
++		return r.createErrorResponse(503, "ALP replay capacity unavailable")
++	}
++	body, err = sjson.SetBytes(result.Response, "alp.provider_state", token)
++	if err != nil {
++		return r.createErrorResponse(502, "invalid ALP response")
++	}
++	contentType := "application/json"
++	if ctx.alpBinding.stream {
++		// SSE represents a validated buffered completion. No fake token deltas.
++		var response map[string]any
++		if json.Unmarshal(body, &response) != nil {
++			return r.createErrorResponse(502, "invalid ALP response")
++		}
++		event, _ := json.Marshal(map[string]any{"type": "agent_call.completed", "response": response})
++		body = append(append([]byte("data: "), event...), []byte("\n\ndata: [DONE]\n\n")...)
++		contentType = "text/event-stream"
++	}
++	return buildResponseBodyContinueResponse(&ext_proc.BodyMutation{Mutation: &ext_proc.BodyMutation_Body{Body: body}},
++		&ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}, SetHeaders: []*core.HeaderValueOption{{
++			Header: &core.HeaderValue{Key: "content-type", RawValue: []byte(contentType)},
++		}}})
++}
++
++func alpResponseHeaders(ctx *RequestContext) *ext_proc.HeaderMutation {
++	contentType := "application/json"
++	if ctx.alpBinding.stream {
++		contentType = "text/event-stream"
++	}
++	return &ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}, SetHeaders: []*core.HeaderValueOption{{Header: &core.HeaderValue{Key: "content-type", RawValue: []byte(contentType)}}}}
++}
++
++func alpBufferedResponseHeaders(ctx *RequestContext) *ext_proc.ProcessingResponse {
++	response := buildResponseHeadersContinueResponse(alpResponseHeaders(ctx), false)
++	response.ModeOverride = &http_ext.ProcessingMode{ResponseBodyMode: http_ext.ProcessingMode_BUFFERED}
++	return response
++}
+diff --git a/src/semantic-router/pkg/extproc/processor_alp_test.go b/src/semantic-router/pkg/extproc/processor_alp_test.go
+new file mode 100644
+index 000000000..63fbc455c
+--- /dev/null
++++ b/src/semantic-router/pkg/extproc/processor_alp_test.go
+@@ -0,0 +1,195 @@
++package extproc
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"testing"
++
++	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++	"github.com/tidwall/gjson"
++
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
++	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
++)
++
++func TestNativeALPDuplicateHeaders(t *testing.T) {
++	for _, key := range []string{"x-alp-task-context", "x-alp-provider-state", "authorization"} {
++		for _, coalesced := range []bool{false, true} {
++			v := newRequestHeaders("POST", "/v1/alp/chat/completions")
++			v.RequestHeaders.Headers.Headers = append(v.RequestHeaders.Headers.Headers,
++				&core.HeaderValue{Key: key, RawValue: []byte("first")})
++			if coalesced {
++				v.RequestHeaders.Headers.Headers[len(v.RequestHeaders.Headers.Headers)-1].RawValue = []byte("first,second")
++			} else {
++				v.RequestHeaders.Headers.Headers = append(v.RequestHeaders.Headers.Headers,
++					&core.HeaderValue{Key: key, RawValue: []byte("second")})
++			}
++			ctx := &RequestContext{Headers: map[string]string{}}
++			response, err := alpTestRouter(t).handleRequestHeaders(v, ctx)
++			if err != nil || response.GetImmediateResponse().GetStatus().GetCode() != 403 {
++				t.Fatalf("duplicate %s was not rejected: %v", key, err)
++			}
++		}
++	}
++}
++
++func TestNativeALPProviderErrorStatus(t *testing.T) {
++	for _, code := range []int{401, 429, 502, 503, 504} {
++		ctx := &RequestContext{UpstreamStatusCode: code, alpBinding: &alpRequestBinding{}}
++		result := alpTestRouter(t).handleALPResponseBody([]byte(`{}`), ctx)
++		mutation := result.GetResponseBody().GetResponse().GetHeaderMutation()
++		found := false
++		for _, h := range mutation.GetSetHeaders() {
++			if h.Header.Key == ":status" {
++				found = string(h.Header.RawValue) == fmt.Sprint(code)
++			}
++		}
++		if !found {
++			t.Fatalf("provider HTTP %d changed to another status", code)
++		}
++	}
++}
++
++func TestALPExtProcWorkerProcess(t *testing.T) {
++	if os.Getenv("ALP_EXTPROC_TEST") != "1" {
++		return
++	}
++	var input map[string]json.RawMessage
++	_ = json.NewDecoder(os.Stdin).Decode(&input)
++	var action string
++	_ = json.Unmarshal(input["action"], &action)
++	result := map[string]any{"ok": true}
++	if action == "prepare" {
++		result["context"] = map[string]any{"private": "state"}
++		result["body"] = json.RawMessage(`{"model":"cloud/chat","messages":[{"role":"user","content":"call the agent"}],"tools":[{"type":"function","function":{"name":"alp_agent_call","parameters":{"type":"object","properties":{},"additionalProperties":false}}}],"tool_choice":{"type":"function","function":{"name":"alp_agent_call"}},"parallel_tool_calls":false,"stream":false}`)
++		var source string
++		_ = json.Unmarshal(input["body"], &source)
++		var projected map[string]json.RawMessage
++		_ = json.Unmarshal(result["body"].(json.RawMessage), &projected)
++		projected["model"], _ = json.Marshal(gjson.Get(source, "model").String())
++		result["body"] = projected
++	} else {
++		var body string
++		_ = json.Unmarshal(input["body"], &body)
++		if body == "invalid" {
++			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": false, "status": 502, "error": map[string]any{"type": "alp_error", "code": "INVALID_ALP_OUTPUT", "message": "Invalid output."}})
++			os.Exit(0)
++		}
++		result["response"] = json.RawMessage(`{"object":"alp.chat.completion","choices":[],"alp":{"validated":true,"executed":false}}`)
++		result["history"] = json.RawMessage(`{"messages":[{"role":"assistant","reasoning":"private"}]}`)
++	}
++	_ = json.NewEncoder(os.Stdout).Encode(result)
++	os.Exit(0)
++}
++
++func alpTestRouter(t *testing.T) *OpenAIRouter {
++	t.Helper()
++	t.Setenv("ALP_EXTPROC_TEST", "1")
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	disabled := false
++	return &OpenAIRouter{Config: &config.RouterConfig{ALP: config.ALPIntegrationConfig{
++		Enabled: true,
++		Command: []string{exe, "-test.run=^TestALPExtProcWorkerProcess$"}, WorkerEnv: []string{"ALP_EXTPROC_TEST", "LD_LIBRARY_PATH"},
++		Models: map[string]config.ALPModelPolicy{"cloud/chat": {EnableThinking: &disabled, AllowStopToolCall: true}},
++	}}}
++}
++
++func TestNativeALPTransportEdge(t *testing.T) {
++	r := alpTestRouter(t)
++	ctx := &RequestContext{Headers: map[string]string{":path": "/v1/alp/chat/completions", "authorization": "Bearer caller"}}
++	request, early := r.prepareProtocolRequest([]byte(`{"model":"cloud/chat","messages":[],"stream":true,"alp":{"catalog_ref":"demo"}}`), ctx)
++	if early != nil || request == nil || ctx.alpBinding == nil || request.Stream {
++		t.Fatal("ALP ingress projection failed")
++	}
++	if !ctx.CacheReadBypass || !ctx.CacheWriteBypass {
++		t.Fatal("ALP cache not bypassed")
++	}
++	dispatch := &providerDispatch{logicalModel: "cloud/chat", targetFormat: llmprotocol.OpenAIChatV1}
++	body, err := r.adaptALPDispatch([]byte(`{"max_completion_tokens":123}`), dispatch, ctx)
++	if err != nil || gjson.GetBytes(body, "enable_thinking").Bool() || !gjson.GetBytes(body, "enable_thinking").Exists() || gjson.GetBytes(body, "max_tokens").Int() != 123 {
++		t.Fatal("provider policy not applied")
++	}
++	ctx.UpstreamStatusCode = 200
++	ctx.RequestModel = "cloud/chat"
++	response := r.handleALPResponseBody([]byte(`{}`), ctx)
++	mut := response.GetResponseBody().GetResponse().GetBodyMutation().GetBody()
++	if len(mut) == 0 || string(mut[:6]) != "data: " {
++		t.Fatal("buffered ALP SSE missing")
++	}
++	if bytes.Contains(mut, []byte("private")) || bytes.Contains(mut, []byte("reasoning")) {
++		t.Fatal("private history leaked")
++	}
++	failure := r.handleALPResponseBody([]byte("invalid"), ctx).GetResponseBody().GetResponse()
++	if !bytes.Contains(failure.GetBodyMutation().GetBody(), []byte("INVALID_ALP_OUTPUT")) {
++		t.Fatal("ALP error code was lost")
++	}
++	foundStatus := false
++	for _, h := range failure.GetHeaderMutation().GetSetHeaders() {
++		if h.Header.Key == ":status" && string(h.Header.RawValue) == "502" {
++			foundStatus = true
++		}
++	}
++	if !foundStatus {
++		t.Fatal("buffered validation error must change HTTP status")
++	}
++	if r.shouldAttemptFallback(ctx) {
++		t.Fatal("ALP must not trigger hidden model retries")
++	}
++}
++
++func TestNativeALPDisabledUnknownAndForeignReplay(t *testing.T) {
++	r := alpTestRouter(t)
++	ctx := &RequestContext{Headers: map[string]string{":path": "/v1/alp/chat/completions", "authorization": "Bearer caller"}}
++	body := []byte(`{"model":"cloud/chat","alp":{"catalog_ref":"demo"}}`)
++	ctx.Headers["x-alp-provider-state"] = "unknown"
++	_, early := r.prepareALPRequest(body, ctx)
++	if early.GetImmediateResponse().GetStatus().GetCode() != 409 {
++		t.Fatal("foreign state accepted")
++	}
++	delete(ctx.Headers, "x-alp-provider-state")
++	delete(ctx.Headers, "authorization")
++	_, early = r.prepareALPRequest(body, ctx)
++	if early.GetImmediateResponse().GetStatus().GetCode() != 401 {
++		t.Fatal("unauthenticated replay enabled")
++	}
++	r.Config.ALP.Enabled = false
++	_, early = r.prepareALPRequest(body, ctx)
++	if early.GetImmediateResponse().GetStatus().GetCode() != 404 {
++		t.Fatal("disabled transport accepted")
++	}
++	if r.validateRequestHeaders("POST", "/v1/alp/chat/completions") != nil {
++		t.Fatal("ALP route missing")
++	}
++	if r.validateRequestHeaders("GET", "/v1/alp/chat/completions").GetImmediateResponse().GetStatus().GetCode() != 405 {
++		t.Fatal("ALP method check missing")
++	}
++}
++
++func TestNativeALPEntrypointAndSelectedModelPolicy(t *testing.T) {
++	r := alpTestRouter(t)
++	r.Config.RequireEntrypoint = true
++	r.Config.AutoModelNames = []string{"cloud-only"}
++	ctx := &RequestContext{Headers: map[string]string{":path": "/v1/alp/chat/completions", "authorization": "Bearer caller"}}
++	request, early := r.prepareProtocolRequest([]byte(`{"model":"cloud-only","alp":{"catalog_ref":"demo"}}`), ctx)
++	if early != nil || request.Model != "cloud-only" {
++		t.Fatal("ALP public entrypoint was not preserved")
++	}
++	_, err := r.adaptALPDispatch([]byte(`{}`), &providerDispatch{logicalModel: "not-enabled", targetFormat: llmprotocol.OpenAIChatV1}, ctx)
++	if err == nil {
++		t.Fatal("selected backend escaped the ALP allowlist")
++	}
++	ctx.alpBinding.expectedModel = "another-model"
++	_, err = r.adaptALPDispatch([]byte(`{}`), &providerDispatch{logicalModel: "cloud/chat", targetFormat: llmprotocol.OpenAIChatV1}, ctx)
++	if err == nil {
++		t.Fatal("private replay switched provider models")
++	}
++	_, early = r.prepareProtocolRequest([]byte(`{"model":"cloud/chat","alp":{"catalog_ref":"demo"}}`), &RequestContext{Headers: ctx.Headers})
++	if early.GetImmediateResponse().GetStatus().GetCode() != 400 {
++		t.Fatal("global entrypoint policy was bypassed")
++	}
++}
+diff --git a/src/semantic-router/pkg/extproc/processor_protocol_contract.go b/src/semantic-router/pkg/extproc/processor_protocol_contract.go
+index 63a72d308..9942f2208 100644
+--- a/src/semantic-router/pkg/extproc/processor_protocol_contract.go
++++ b/src/semantic-router/pkg/extproc/processor_protocol_contract.go
+@@ -133,6 +133,11 @@ func (r *OpenAIRouter) prepareProtocolRequest(
+ 	if ctx.SourceFormat == "" {
+ 		ctx.SourceFormat = llmprotocol.OpenAIChatV1
+ 	}
++	var alpError *ext_proc.ProcessingResponse
++	body, alpError = r.prepareALPRequest(body, ctx)
++	if alpError != nil {
++		return nil, alpError
++	}
+ 	body = withAzureDeploymentModel(body, ctx.Headers[":path"])
+ 	engine, err := r.protocolEngine()
+ 	if err != nil {
+diff --git a/src/semantic-router/pkg/extproc/processor_req_body.go b/src/semantic-router/pkg/extproc/processor_req_body.go
+index 6dd78d79c..7b76ba98d 100644
+--- a/src/semantic-router/pkg/extproc/processor_req_body.go
++++ b/src/semantic-router/pkg/extproc/processor_req_body.go
+@@ -113,6 +113,9 @@ func (r *OpenAIRouter) handleModelRoutingWithPersonalizedCache(
+ // handleModelRouting handles model selection and routing logic
+ // decisionName, reasoningDecision, and selectedModel are pre-computed from ProcessRequest
+ func (r *OpenAIRouter) handleModelRouting(request *llmprotocol.Request, originalModel string, decisionName string, reasoningDecision entropy.ReasoningDecision, selectedModel string, ctx *RequestContext) (*ext_proc.ProcessingResponse, error) {
++	if ctx.alpBinding != nil && r.routeExecutesLooper(ctx) {
++		return r.createErrorResponse(400, "ALP transport does not execute router agent loops"), nil
++	}
+ 	if changed, err := r.applyPreDispatchToolsPolicy(ctx); err != nil {
+ 		return nil, err
+ 	} else if changed {
+diff --git a/src/semantic-router/pkg/extproc/processor_req_body_routing.go b/src/semantic-router/pkg/extproc/processor_req_body_routing.go
+index 4267f45ca..fd84df853 100644
+--- a/src/semantic-router/pkg/extproc/processor_req_body_routing.go
++++ b/src/semantic-router/pkg/extproc/processor_req_body_routing.go
+@@ -299,6 +299,9 @@ func (r *OpenAIRouter) buildProviderDispatchResponse(
+ 		removeHeaders: []string{"content-length"},
+ 		profile:       dispatch.profile,
+ 	}
++	if ctx.alpBinding != nil {
++		state.removeHeaders = append(state.removeHeaders, "x-alp-task-context", "x-alp-provider-state")
++	}
+ 	// Provider metadata is applied before credentials so an operator-supplied
+ 	// extra header can never replace the credential selected for this request.
+ 	appendProfileHeaders(&state.setHeaders, dispatch.profile)
+diff --git a/src/semantic-router/pkg/extproc/processor_req_header.go b/src/semantic-router/pkg/extproc/processor_req_header.go
+index 75a187d5e..f164b0e73 100644
+--- a/src/semantic-router/pkg/extproc/processor_req_header.go
++++ b/src/semantic-router/pkg/extproc/processor_req_header.go
+@@ -22,6 +22,9 @@ func (r *OpenAIRouter) handleRequestHeaders(v *ext_proc.ProcessingRequest_Reques
+ 	span := startRequestHeaderSpan(v, ctx)
+ 
+ 	method, path := captureRequestHeaders(v, ctx, r.skipProcessingEnabled())
++	if normalizeRequestPath(path) == "/v1/alp/chat/completions" && duplicateALPHeader(v) {
++		return r.createErrorResponse(403, "duplicate ALP identity or task header"), nil
++	}
+ 	setRequestHeaderSpanAttributes(span, ctx, method, path)
+ 	if rejected := r.benchmarkConfigPrecondition(ctx); rejected != nil {
+ 		return rejected, nil
+diff --git a/src/semantic-router/pkg/extproc/processor_req_header_validation.go b/src/semantic-router/pkg/extproc/processor_req_header_validation.go
+index 2f1295fd8..3e29e5c2d 100644
+--- a/src/semantic-router/pkg/extproc/processor_req_header_validation.go
++++ b/src/semantic-router/pkg/extproc/processor_req_header_validation.go
+@@ -10,7 +10,7 @@ func (r *OpenAIRouter) validateRequestHeaders(method string, path string) *ext_p
+ 	normalizedPath := normalizeRequestPath(path)
+ 
+ 	switch normalizedPath {
+-	case "/v1/chat/completions", azureV1ChatPath:
++	case "/v1/alp/chat/completions", "/v1/chat/completions", azureV1ChatPath:
+ 		return validateAllowedMethod(r, method, "POST")
+ 	case "/v1/embeddings", "/v1/video/generations", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/videos", "/v1/videos/sync", "/v1/images/edits", "/v1/audio/generate", "/v1/audio/speech", "/v1/images/generations", "/v1/messages":
+ 		return validateAllowedMethod(r, method, "POST")
+diff --git a/src/semantic-router/pkg/extproc/processor_res_body.go b/src/semantic-router/pkg/extproc/processor_res_body.go
+index 3a419a154..079e77b07 100644
+--- a/src/semantic-router/pkg/extproc/processor_res_body.go
++++ b/src/semantic-router/pkg/extproc/processor_res_body.go
+@@ -11,6 +11,9 @@ import (
+ 
+ // handleResponseBody processes the response body.
+ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_ResponseBody, ctx *RequestContext) (*ext_proc.ProcessingResponse, error) {
++	if ctx.alpBinding != nil {
++		return r.handleALPResponseBody(v.ResponseBody.Body, ctx), nil
++	}
+ 	if ctx.SemanticRequest != nil && ctx.SemanticRequest.Realtime != nil {
+ 		return buildResponseBodyContinueResponse(nil, nil), nil
+ 	}
+diff --git a/src/semantic-router/pkg/extproc/processor_res_header.go b/src/semantic-router/pkg/extproc/processor_res_header.go
+index fcd80315d..f20c4704e 100644
+--- a/src/semantic-router/pkg/extproc/processor_res_header.go
++++ b/src/semantic-router/pkg/extproc/processor_res_header.go
+@@ -14,6 +14,10 @@ func (r *OpenAIRouter) handleResponseHeaders(v *ext_proc.ProcessingRequest_Respo
+ 	if ctx != nil && v != nil {
+ 		ctx.UpstreamStatusCode = getStatusFromHeaders(v.ResponseHeaders.GetHeaders())
+ 	}
++	if ctx.alpBinding != nil {
++		ctx.IsStreamingResponse = false
++		return alpBufferedResponseHeaders(ctx), nil
++	}
+ 	if skipResp := r.handleSkipProcessingResponseHeaders(v, ctx); skipResp != nil {
+ 		return skipResp, nil
+ 	}
+diff --git a/src/semantic-router/pkg/extproc/provider_request_adapter.go b/src/semantic-router/pkg/extproc/provider_request_adapter.go
+index 98b462575..e41f8050c 100644
+--- a/src/semantic-router/pkg/extproc/provider_request_adapter.go
++++ b/src/semantic-router/pkg/extproc/provider_request_adapter.go
+@@ -47,7 +47,7 @@ func (r *OpenAIRouter) adaptProviderRequest(
+ 		}
+ 	}
+ 	reportDroppedReasoningSummary(ctx, dispatch, encoded, body)
+-	return body, nil
++	return r.adaptALPDispatch(body, dispatch, ctx)
+ }
+ 
+ // reportDroppedReasoningSummary records a Responses summary request removed by
+diff --git a/src/semantic-router/pkg/extproc/recorder.go b/src/semantic-router/pkg/extproc/recorder.go
+index 852d70158..2d38c0522 100644
+--- a/src/semantic-router/pkg/extproc/recorder.go
++++ b/src/semantic-router/pkg/extproc/recorder.go
+@@ -99,6 +99,9 @@ func (r *OpenAIRouter) startRouterReplay(
+ 	selectedModel string,
+ 	decisionName string,
+ ) {
++	if ctx != nil && ctx.alpBinding != nil {
++		return
++	}
+ 	if !shouldStartRouterReplay(ctx) || !r.replayAllowedForRequest(ctx) {
+ 		return
+ 	}
+diff --git a/src/semantic-router/pkg/extproc/request_context.go b/src/semantic-router/pkg/extproc/request_context.go
+index 4869a28c1..abd492099 100644
+--- a/src/semantic-router/pkg/extproc/request_context.go
++++ b/src/semantic-router/pkg/extproc/request_context.go
+@@ -59,6 +59,7 @@ type EnhancedHallucinationInfo struct {
+ 
+ // RequestContext holds the context for processing a request.
+ type RequestContext struct {
++	alpBinding                *alpRequestBinding
+ 	videoBinding              *videoRequestBinding
+ 	learningPreview           *routerLearningPreviewSnapshot // Request-local, read-only selection state; never used by generation.
+ 	AutomaticCandidateDemands map[string]selection.CandidateDemand
+diff --git a/src/semantic-router/pkg/extproc/shadow_dispatch.go b/src/semantic-router/pkg/extproc/shadow_dispatch.go
+index 47cb17bc6..3721acaa8 100644
+--- a/src/semantic-router/pkg/extproc/shadow_dispatch.go
++++ b/src/semantic-router/pkg/extproc/shadow_dispatch.go
+@@ -204,6 +204,9 @@ func (d *shadowDispatcher) waitIdle(timeout time.Duration) bool {
+ // neutral request the primary was rendered from. Nothing here can fail the
+ // request.
+ func (r *OpenAIRouter) dispatchShadowIfConfigured(ctx *RequestContext, dispatch *providerDispatch) {
++	if ctx != nil && ctx.alpBinding != nil {
++		return
++	}
+ 	if r == nil || r.ShadowDispatcher == nil || ctx == nil || dispatch == nil {
+ 		return
+ 	}
+diff --git a/src/semantic-router/pkg/extproc/status_code_mapping.go b/src/semantic-router/pkg/extproc/status_code_mapping.go
+index 22dd1438c..9c6371070 100644
+--- a/src/semantic-router/pkg/extproc/status_code_mapping.go
++++ b/src/semantic-router/pkg/extproc/status_code_mapping.go
+@@ -37,6 +37,8 @@ func statusCodeToImmediateResponseCode(statusCode int) typev3.StatusCode {
+ 		return typev3.StatusCode_BadGateway
+ 	case http.StatusServiceUnavailable:
+ 		return typev3.StatusCode_ServiceUnavailable
++	case http.StatusGatewayTimeout:
++		return typev3.StatusCode_GatewayTimeout
+ 	default:
+ 		return typev3.StatusCode_OK
+ 	}

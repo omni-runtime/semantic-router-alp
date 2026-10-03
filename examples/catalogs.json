@@ -1,0 +1,71 @@
+{
+  "backend": "auto",
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "allow_reasoning": false,
+  "catalogs": {
+    "product-assistant": {
+      "allowed_operations": [
+        "agent_definition_generate",
+        "agent_call",
+        "agent_capability_call",
+        "list_agent_capabilities",
+        "tool_call",
+        "agent_final"
+      ],
+      "agents": {
+        "product_assistant_001": {
+          "description": "Product information assistant. Example instance; bind real instances in production.",
+          "input_schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          },
+          "capabilities": {
+            "answer_product_question": {
+              "description": "Answer a product question.",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "question": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  }
+                },
+                "required": [
+                  "question"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      },
+      "tools": {
+        "math.add": {
+          "description": "Add two numbers. Execution is supplied by the host Runtime.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "number"
+              },
+              "b": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "a",
+              "b"
+            ],
+            "additionalProperties": false
+          },
+          "external_effect": "none"
+        }
+      },
+      "final_format": "text"
+    }
+  }
+}

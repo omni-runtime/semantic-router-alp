@@ -1,0 +1,147 @@
+contract_version: 1
+upstream:
+  repository: https://github.com/vllm-project/semantic-router.git
+  commit: 5aa0145eb16ddf7edcc40a87793f61260e8c5084
+patch_set:
+  version: 0.1.0
+  series: patches/series
+  checksums:
+    0001-native-alp.patch: 47864f2e7d3c834c7828b0b37fa3eccb4cc482c0d6d9888af0569bd543be1057
+config:
+  schema: v0.3
+  extension: multimodal-v1
+  require_entrypoint: true
+status: preview
+release_version: 0.1.0-preview.1
+images:
+- reference: docker.io/inference-stack/semantic-router-multimodal@sha256:d116b3581a55209d6fe6e9d8beecaa8b83f1e81a7e6c0be7a5adce4b6cc596d5
+  tag: docker.io/inference-stack/semantic-router-multimodal:alp-ffe40b62ad01-arm64
+  digest: sha256:d116b3581a55209d6fe6e9d8beecaa8b83f1e81a7e6c0be7a5adce4b6cc596d5
+  platform: linux/arm64
+  config_digest: sha256:0e32b2bdeb24ce03d1bcfd2c319dcd157618e4cbf54831b1be819eefb2c6a465
+  base_digest: sha256:295a7da1ac432c950667083208a5a227e695efdc7b53502139d4c80c0b18b061
+  binary_digest: sha256:7c015bee00b4b327c2281647876b5bf98e71554c8c2e5c2a1593a7b4d49e9131
+  patch_digest: ffe40b62ad01064e7cca4c7b56477b52ca048ed6def4aca82e8c1bbee2d9bd13
+  upstream_commit: 5aa0145eb16ddf7edcc40a87793f61260e8c5084
+  build_method: cross-cgo-qemu-tests-plus-verified-oci-layer
+  acceptance: tested-with-real-backend
+  interfaces:
+  - chat
+  - speech
+  - images
+  - audio_generate
+  - transcription
+  - translation
+  - image_edit
+  - video_sync
+  - video
+  - realtime
+  - speech_stream
+  - mlx_video
+  - embeddings
+  - ark_embeddings
+  - alp_chat
+  request_capabilities:
+  - text
+  - image_input
+  - audio_input
+  - video_input
+  - tools
+  - structured_json
+  - speech_generation
+  - image_generation
+  - audio_generation
+  - transcription
+  - translation
+  - image_editing
+  - audio_output
+  - video_generation
+  - video_output
+  - realtime
+  - embedding
+  - embedding_token_input
+  runtime_acceptance: SR runtime source is unchanged by extraction; cloud worker and
+    protocol checks are verified separately. Task results remain private.
+  distribution: local-oci-artifact; not published to a public image registry
+  source_equivalence: The composed runtime files match the existing build; only the
+    ALP configuration test example changes its worker module name.
+components:
+  envoy: 1.37.3
+  native_ml_classifiers: false
+  helper_services:
+  - name: redis
+    required_for:
+    - video
+    purpose: SR native scoped TTL protocol bindings
+  native_bindings: true
+  alp_worker:
+    package: semantic-router-alp
+    version: 0.1.0
+    module: semantic_router_alp.cloud_worker
+    dependency:
+      repository: https://github.com/omni-runtime/alp_schema_mcp.git
+      package_version: 0.3.1
+      protocol_version: 0.3.0
+      draft_revision: 1
+      commit: d847c8a31036efa61b21c00bcdf05628c4719e5c
+interfaces:
+  chat:
+    implementation: upstream-plus-existing-native-multimodal-patch
+    status: tested-with-real-backend
+  mlx_video:
+    implementation: native-typed-MLX-task-codec-and-dispatch
+    status: tested-with-real-backend
+    path: /v1/video/generations
+    wire: mlx.video.v1
+    streaming: same-wire JSON / progress SSE with final RGB8 and PCM16 payload
+  embeddings:
+    implementation: native task, space qualification, OpenAI codec and passthrough
+    status: tested-with-real-backend
+    path: /v1/embeddings
+    wire: openai.embeddings.v1
+  ark_embeddings:
+    implementation: native Ark egress request codec and embedding response container
+      conversion
+    status: tested-with-real-backend
+    path: /api/v3/embeddings/multimodal
+    wire: ark.embeddings.v1
+    client_path: /v1/embeddings
+    limits: one joint text/image sample; float/base64; discrete model dimensions
+limitations:
+- Local OCI artifact; registry distribution is not published.
+- ALP requires separately authorized private dependencies.
+- ALP validation rejects invalid cloud responses; strict Function Calling enforcement
+  is provider-dependent.
+base_release: https://github.com/omni-runtime/semantic-router-multimodal/blob/b794a9e868bb9d930869d50c813c8d66c1e26a45/release.yaml
+features:
+  alp_chat:
+    path: /v1/alp/chat/completions
+    transport: provider-native OpenAI Chat Function Calling
+    contract_source: separately authorized alp_schema_mcp dependency
+    execution: host-owned; SR validates and adapts only
+known_limits:
+  alp_provider_generation: Strict outer Function Calling enforcement is provider-dependent;
+    invalid responses are rejected.
+  alp_replay: Process-local; use one router replica or sticky routing.
+  verification_reports: Local only; no validation reports are published.
+verification_report_policy: private
+source_repository: https://github.com/omni-runtime/semantic-router-alp
+source_composition:
+  upstream:
+    repository: https://github.com/vllm-project/semantic-router.git
+    commit: 5aa0145eb16ddf7edcc40a87793f61260e8c5084
+    patch_version: 0.1.0
+    go: 1.25.0
+    config_schema: v0.3
+  multimodal:
+    repository: https://github.com/omni-runtime/semantic-router-multimodal.git
+    commit: b794a9e868bb9d930869d50c813c8d66c1e26a45
+    patches:
+      0001-native-multimodal.patch: 75c6573ad52af184c6a992f66b513caa6bfb919b08e2e9691514196b8b424334
+  contracts:
+    repository: https://github.com/omni-runtime/alp_schema_mcp.git
+    package_version: 0.3.1
+    protocol_version: 0.3.0
+    draft_revision: 1
+    commit: d847c8a31036efa61b21c00bcdf05628c4719e5c
+  composed_patch_sha256: abe669f85cc00e191e7ef533e08d227972dd6d8f38c1c8c72c997a5f026bb448

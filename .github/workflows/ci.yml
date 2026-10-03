@@ -1,0 +1,54 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      private_tests:
+        description: Run contract tests using ALP_CONTRACTS_TOKEN
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  public-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - run: python scripts/validate-public.py
+      - run: python scripts/prepare.py --output .work/prepared
+  contract-tests:
+    if: github.event_name == 'workflow_dispatch' && inputs.private_tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - id: dependency
+        run: |
+          python - <<'PYTHON'
+          import json, os
+          revision = json.load(open('dependencies.lock.json'))['contracts']['commit']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('revision=' + revision + '\n')
+          PYTHON
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: omni-runtime/alp_schema_mcp
+          ref: ${{ steps.dependency.outputs.revision }}
+          token: ${{ secrets.ALP_CONTRACTS_TOKEN }}
+          path: .work/contracts
+          persist-credentials: false
+      - run: python -m pip install '.work/contracts[runtime]' '.[test]'
+      - run: python -m pytest

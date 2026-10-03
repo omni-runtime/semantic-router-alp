@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-router-alp"
+version = "0.1.0"
+description = "Provider-native ALP protocol adaptation for Semantic Router."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["alp-schema-mcp[runtime]==0.3.1", "starlette>=0.40,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "httpx>=0.28,<1", "build>=1,<2"]
+
+[project.urls]
+Repository = "https://github.com/omni-runtime/semantic-router-alp"
+Issues = "https://github.com/omni-runtime/semantic-router-alp/issues"
+
+[project.scripts]
+semantic-router-alp-worker = "semantic_router_alp.cloud_worker:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
